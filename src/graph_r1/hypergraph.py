@@ -221,13 +221,23 @@ class KnowledgeHyperGraph:
 
     def build_embeddings(self, device: str = "cpu") -> None:
         """Encode entities and hyperedges using bge-large-en-v1.5."""
-        from FlagEmbedding import FlagAutoModel
-
-        model = FlagAutoModel.from_finetuned(
-            self.embedding_model_name,
-            query_instruction_for_retrieval="Represent this sentence for searching relevant passages: ",
-            devices=device,
-        )
+        model = None
+        try:
+            from FlagEmbedding import FlagAutoModel
+            model = FlagAutoModel.from_finetuned(
+                self.embedding_model_name,
+                query_instruction_for_retrieval="Represent this sentence for searching relevant passages: ",
+                devices=device,
+            )
+        except Exception as e:
+            print(f"FlagEmbedding failed ({e}), falling back to sentence-transformers")
+            from sentence_transformers import SentenceTransformer
+            _st_model = SentenceTransformer(self.embedding_model_name, device=device)
+            class _STWrapper:
+                def encode(self, texts):
+                    return _st_model.encode(texts, normalize_embeddings=True,
+                                            show_progress_bar=True)
+            model = _STWrapper()
 
         self.entity_names = []
         entity_texts = []
