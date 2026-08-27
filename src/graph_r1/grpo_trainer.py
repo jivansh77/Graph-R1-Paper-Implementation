@@ -1,0 +1,459 @@
+"""
+GRPO Training Pipeline for Graph-R1.
+
+Implements Section 4.3: End-to-end RL Optimization using
+Group Relative Policy Optimization (GRPO).
+
+Key equations:
+- GRPO objective J_GRPO(θ) (Eq. 11)
+- Advantage Â(τ_i) = (R(τ_i) - mean) / std  (Eq. 11)
+- Policy loss with clipped ratio (standard PPO loss)
+- KL regularization toward reference policy
+
+Training hyperparameters from Table 3 / Appendix G:
+- Batch size: 128, LR: 5e-7, Rollout N: 5
+- Max length: 4096, KL coeff (β): 0.001
+- Clip range (ε): 0.2 (standard)
+"""
+
+import json
+import os
+import re
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+@dataclass
+class GRPOConfig:
+    """Configuration for GRPO training."""
+    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    learning_rate: float = 5e-7
+    batch_size: int = 16
+    mini_batch_size: int = 4
+    num_rollouts: int = 5
+    max_prompt_length: int = 4096
+    max_response_length: int = 4096
+    max_turns: int = 5
+    top_k_retrieval: int = 5
+    clip_range: float = 0.2
+    kl_coeff: float = 0.001
+    num_epochs: int = 1
+    gradient_accumulation_steps: int = 4
+    warmup_steps: int = 10
+    save_steps: int = 50
+    eval_steps: int = 10
+    max_grad_norm: float = 1.0
+    output_dir: str = "checkpoints"
+    use_lora: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+
+
+class GRPOTrainer:
+    """Implements GRPO training for Graph-R1.
+
+    This is a simplified but faithful implementation suitable for
+    single-GPU training on Kaggle. The full paper uses 4x A100 GPUs
+    with VERL/Ray, but the core algorithm is identical.
+    """
+
+    def __init__(self, config: GRPOConfig, retriever=None):
+        self.config = config
+        self.retriever = retriever
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True,
+        )
+
+        if config.use_lora:
+            from peft import LoraConfig, get_peft_model
+            lora_config = LoraConfig(
+                r=config.lora_r,
+                lora_alpha=config.lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                "gate_proj", "up_proj", "down_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.model = get_peft_model(self.model, lora_config)
+            self.model.print_trainable_parameters()
+
+        self.model.to(self.device)
+
+        self.ref_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True,
+        ).to(self.device)
+        self.ref_model.eval()
+        for p in self.ref_model.parameters():
+            p.requires_grad = False
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=0.01,
+        )
+
+        self.global_step = 0
+        self.training_log = []
+
+    @torch.no_grad()
+    def generate_rollouts(self, prompts: list[str], ground_truths: list) -> list[dict]:
+        """Generate N rollout trajectories per prompt using the current policy.
+
+        For each prompt, generates num_rollouts completions with multi-turn
+        retrieval interaction.
+        """
+        from .agent import ToolEnv
+        from .rewards import compute_reward
+
+        all_rollouts = []
+        self.model.eval()
+
+        for prompt_idx, (prompt, gt) in enumerate(zip(prompts, ground_truths)):
+            prompt_rollouts = []
+
+            for rollout_idx in range(self.config.num_rollouts):
+                env = ToolEnv(
+                    retriever=self.retriever,
+                    max_turns=self.config.max_turns,
+                    top_k=self.config.top_k_retrieval,
+                )
+
+                current_text = prompt
+                full_response = ""
+                is_done = False
+
+                for turn in range(self.config.max_turns):
+                    if is_done:
+                        break
+
+                    inputs = self.tokenizer(
+                        current_text,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=self.config.max_prompt_length,
+                    ).to(self.device)
+
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            **inputs,
+                            max_new_tokens=min(512, self.config.max_response_length),
+                            do_sample=True,
+                            temperature=0.7,
+                            top_p=0.9,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                        )
+
+                    response = self.tokenizer.decode(
+                        outputs[0][inputs["input_ids"].shape[1]:],
+                        skip_special_tokens=False,
+                    )
+
+                    eos_token = self.tokenizer.eos_token or "<|im_end|>"
+                    if eos_token in response:
+                        response = response[:response.index(eos_token)]
+
+                    full_response += response
+                    observation, is_done = env.step(response)
+
+                    if not is_done and observation:
+                        obs_text = f"\n<|im_start|>user\n<knowledge>{observation}</knowledge>\n<|im_end|>\n<|im_start|>assistant\n"
+                        current_text = current_text + response + obs_text
+                        full_response += obs_text
+
+                solution = prompt + full_response
+                reward = compute_reward(solution, gt)
+
+                prompt_rollouts.append({
+                    "prompt": prompt,
+                    "response": full_response,
+                    "solution": solution,
+                    "reward": reward,
+                    "ground_truth": gt,
+                    "prompt_idx": prompt_idx,
+                })
+
+            all_rollouts.extend(prompt_rollouts)
+
+        self.model.train()
+        return all_rollouts
+
+    def compute_advantages(self, rollouts: list[dict]) -> list[dict]:
+        """Compute GRPO advantages: normalize rewards within each prompt group.
+
+        Â(τ_i) = (R(τ_i) - mean({R(τ_j)})) / std({R(τ_j)})
+        """
+        groups = defaultdict(list)
+        for r in rollouts:
+            groups[r["prompt_idx"]].append(r)
+
+        for prompt_idx, group in groups.items():
+            rewards = [r["reward"] for r in group]
+            mean_r = np.mean(rewards)
+            std_r = np.std(rewards) + 1e-6
+
+            for r in group:
+                r["advantage"] = (r["reward"] - mean_r) / std_r
+
+        return rollouts
+
+    def compute_policy_loss(self, rollouts: list[dict]) -> torch.Tensor:
+        """Compute the GRPO clipped policy loss with KL regularization."""
+        total_loss = torch.tensor(0.0, device=self.device)
+        num_valid = 0
+
+        for rollout in rollouts:
+            prompt_text = rollout["prompt"]
+            response_text = rollout["response"]
+            advantage = rollout["advantage"]
+
+            full_text = prompt_text + response_text
+            encoding = self.tokenizer(
+                full_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.config.max_prompt_length + self.config.max_response_length,
+            ).to(self.device)
+
+            prompt_encoding = self.tokenizer(
+                prompt_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.config.max_prompt_length,
+            )
+            prompt_len = prompt_encoding["input_ids"].shape[1]
+            response_len = encoding["input_ids"].shape[1] - prompt_len
+
+            if response_len <= 0:
+                continue
+
+            with torch.no_grad():
+                ref_outputs = self.ref_model(**encoding)
+                ref_logits = ref_outputs.logits[:, prompt_len - 1:-1, :]
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+                response_tokens = encoding["input_ids"][:, prompt_len:]
+                ref_token_log_probs = ref_log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
+
+            outputs = self.model(**encoding)
+            logits = outputs.logits[:, prompt_len - 1:-1, :]
+            log_probs = F.log_softmax(logits, dim=-1)
+            token_log_probs = log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
+
+            ratio = torch.exp(token_log_probs - ref_token_log_probs.detach())
+
+            advantage_tensor = torch.tensor(advantage, device=self.device, dtype=torch.float32)
+            pg_loss1 = -advantage_tensor * ratio
+            pg_loss2 = -advantage_tensor * torch.clamp(
+                ratio, 1.0 - self.config.clip_range, 1.0 + self.config.clip_range
+            )
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            kl_div = (ref_token_log_probs.detach() - token_log_probs).mean()
+            loss = pg_loss + self.config.kl_coeff * kl_div
+
+            total_loss = total_loss + loss
+            num_valid += 1
+
+        if num_valid > 0:
+            total_loss = total_loss / num_valid
+
+        return total_loss
+
+    def train_step(self, batch_prompts: list[str], batch_gts: list) -> dict:
+        """Execute one GRPO training step.
+
+        1. Generate N rollouts per prompt
+        2. Compute rewards and advantages
+        3. Update policy with clipped loss + KL
+        """
+        rollouts = self.generate_rollouts(batch_prompts, batch_gts)
+        rollouts = self.compute_advantages(rollouts)
+
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        loss = self.compute_policy_loss(rollouts)
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+        self.optimizer.step()
+
+        rewards = [r["reward"] for r in rollouts]
+        advantages = [r["advantage"] for r in rollouts]
+
+        metrics = {
+            "loss": loss.item(),
+            "mean_reward": np.mean(rewards),
+            "std_reward": np.std(rewards),
+            "mean_advantage": np.mean(advantages),
+            "num_rollouts": len(rollouts),
+            "step": self.global_step,
+        }
+
+        self.global_step += 1
+        self.training_log.append(metrics)
+
+        return metrics
+
+    def train(self, train_data: list[dict], eval_data: list[dict] | None = None) -> list[dict]:
+        """Full training loop over the dataset."""
+        os.makedirs(self.config.output_dir, exist_ok=True)
+
+        num_batches = len(train_data) // self.config.batch_size
+        all_metrics = []
+
+        for epoch in range(self.config.num_epochs):
+            indices = np.random.permutation(len(train_data))
+
+            for batch_idx in range(num_batches):
+                start = batch_idx * self.config.batch_size
+                end = start + self.config.batch_size
+                batch_indices = indices[start:end]
+
+                batch = [train_data[i] for i in batch_indices]
+                prompts = []
+                gts = []
+                for item in batch:
+                    if isinstance(item["prompt"], list):
+                        prompt_text = item["prompt"][0]["content"]
+                    else:
+                        prompt_text = item["prompt"]
+                    prompts.append(f"<|im_start|>user\n{prompt_text}\n<|im_end|>\n<|im_start|>assistant\n")
+                    gts.append(item["reward_model"]["ground_truth"])
+
+                mini_batch_size = min(self.config.mini_batch_size, len(prompts))
+                for mb_start in range(0, len(prompts), mini_batch_size):
+                    mb_end = min(mb_start + mini_batch_size, len(prompts))
+                    mb_prompts = prompts[mb_start:mb_end]
+                    mb_gts = gts[mb_start:mb_end]
+
+                    metrics = self.train_step(mb_prompts, mb_gts)
+                    all_metrics.append(metrics)
+
+                    if self.global_step % 10 == 0:
+                        print(
+                            f"Step {self.global_step} | "
+                            f"Loss: {metrics['loss']:.4f} | "
+                            f"Reward: {metrics['mean_reward']:.4f} | "
+                            f"Std: {metrics['std_reward']:.4f}"
+                        )
+
+                if self.config.eval_steps and self.global_step % self.config.eval_steps == 0:
+                    if eval_data:
+                        eval_metrics = self.evaluate(eval_data[:32])
+                        print(f"  Eval F1: {eval_metrics.get('f1', 0):.4f}")
+
+                if self.config.save_steps and self.global_step % self.config.save_steps == 0:
+                    self.save_checkpoint()
+
+        self.save_checkpoint()
+        self.save_training_log()
+        return all_metrics
+
+    @torch.no_grad()
+    def evaluate(self, eval_data: list[dict]) -> dict:
+        """Evaluate the current model on a set of examples."""
+        from .rewards import compute_f1, compute_em, extract_answer
+
+        self.model.eval()
+        predictions = []
+        references = []
+
+        for item in tqdm(eval_data, desc="Evaluating"):
+            if isinstance(item["prompt"], list):
+                prompt_text = item["prompt"][0]["content"]
+            else:
+                prompt_text = item["prompt"]
+            prompt = f"<|im_start|>user\n{prompt_text}\n<|im_end|>\n<|im_start|>assistant\n"
+            gt = item["reward_model"]["ground_truth"]
+
+            current_text = prompt
+            for turn in range(self.config.max_turns):
+                inputs = self.tokenizer(
+                    current_text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.config.max_prompt_length,
+                ).to(self.device)
+
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                response = self.tokenizer.decode(
+                    outputs[0][inputs["input_ids"].shape[1]:],
+                    skip_special_tokens=False,
+                )
+                eos_token = self.tokenizer.eos_token or "<|im_end|>"
+                if eos_token in response:
+                    response = response[:response.index(eos_token)]
+
+                if re.search(r"<answer>.*?</answer>", response, re.DOTALL):
+                    current_text += response
+                    break
+
+                query_match = re.search(r"<query>(.*?)</query>", response, re.DOTALL)
+                if query_match and self.retriever:
+                    query = query_match.group(1).strip()
+                    facts = self.retriever.retrieve(query, top_k=self.config.top_k_retrieval)
+                    knowledge = self.retriever.format_knowledge(facts)
+                    obs = f"\n<|im_start|>user\n<knowledge>{knowledge}</knowledge>\n<|im_end|>\n<|im_start|>assistant\n"
+                    current_text += response + obs
+                else:
+                    current_text += response
+                    break
+
+            answer = extract_answer(current_text) or ""
+            predictions.append(answer)
+            references.append(gt)
+
+        em_scores = []
+        f1_scores = []
+        for pred, gt_list in zip(predictions, references):
+            if isinstance(gt_list, str):
+                gt_list = [gt_list]
+            em_scores.append(max(compute_em(pred, gt) for gt in gt_list) if gt_list else 0.0)
+            f1_scores.append(max(compute_f1(pred, gt) for gt in gt_list) if gt_list else 0.0)
+
+        self.model.train()
+        return {
+            "em": np.mean(em_scores),
+            "f1": np.mean(f1_scores),
+            "num_samples": len(predictions),
+        }
+
+    def save_checkpoint(self, path: str | None = None):
+        """Save model checkpoint."""
+        save_path = path or os.path.join(self.config.output_dir, f"step_{self.global_step}")
+        os.makedirs(save_path, exist_ok=True)
+        self.model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
+        with open(os.path.join(save_path, "config.json"), "w") as f:
+            json.dump(vars(self.config), f, indent=2)
+        print(f"Saved checkpoint to {save_path}")
+
+    def save_training_log(self):
+        """Save training metrics log."""
+        log_path = os.path.join(self.config.output_dir, "training_log.json")
+        with open(log_path, "w") as f:
+            json.dump(self.training_log, f, indent=2)
