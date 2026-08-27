@@ -74,9 +74,14 @@ class GRPOTrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        dtype = torch.float32
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(0)
+            dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=dtype,
             trust_remote_code=True,
         )
 
@@ -98,7 +103,7 @@ class GRPOTrainer:
 
         self.ref_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=dtype,
             trust_remote_code=True,
         ).to(self.device)
         self.ref_model.eval()

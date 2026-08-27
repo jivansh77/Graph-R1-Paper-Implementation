@@ -21,23 +21,36 @@ import subprocess
 import sys
 import os
 
+def check_gpu_and_fix_torch():
+    """Check GPU compatibility BEFORE importing torch.
+
+    P100 (sm_60) is not supported by PyTorch >= 2.5 compiled for cu128+.
+    We detect this via nvidia-smi and downgrade torch before any import.
+    """
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=name,compute_cap",
+                                 "--format=csv,noheader"],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            gpu_info = result.stdout.strip()
+            print(f"GPU detected: {gpu_info}")
+            parts = gpu_info.split(",")
+            if len(parts) >= 2:
+                cap_str = parts[1].strip()
+                major = int(cap_str.split(".")[0])
+                if major < 7:
+                    print(f"GPU compute capability {cap_str} < 7.0, installing compatible PyTorch...")
+                    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                                    "torch==2.4.0", "--index-url",
+                                    "https://download.pytorch.org/whl/cu121"],
+                                   capture_output=True, timeout=600)
+                    print("PyTorch downgraded to 2.4.0+cu121 for P100 compatibility")
+    except Exception as e:
+        print(f"GPU check skipped: {e}")
+
+check_gpu_and_fix_torch()
+
 def install_packages():
-    import torch as _t
-    needs_torch_reinstall = False
-    if _t.cuda.is_available():
-        try:
-            cap = _t.cuda.get_device_capability(0)
-            if cap[0] < 7:
-                needs_torch_reinstall = True
-                print(f"GPU capability {cap} < 7.0, downgrading PyTorch for compatibility...")
-        except Exception:
-            pass
-
-    if needs_torch_reinstall:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                        "torch==2.4.0", "--index-url", "https://download.pytorch.org/whl/cu121"],
-                       capture_output=True)
-
     packages = [
         "transformers>=4.40.0",
         "datasets>=2.18.0",
