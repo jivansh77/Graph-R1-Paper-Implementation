@@ -42,4 +42,20 @@
 
 ## Experiment Runs
 
-(Results will be filled in as experiments complete)
+### Run 1: 2WikiMultiHopQA - v1 (FAILED)
+- **Date**: 2026-08-27
+- **Kernel**: jivanshc/graph-r1-reproduction-2wikimultihopqa v1
+- **Error**: PyTorch 2.10.0+cu128 incompatible with P100 (sm_60, requires >=sm_70)
+- **Root cause**: Kaggle's default PyTorch requires CUDA capability >= 7.0, P100 has 6.0
+- **Additional error**: `total_mem` attribute renamed to `total_memory` in newer PyTorch
+
+### Run 2: 2WikiMultiHopQA - v2 (IN PROGRESS)
+- **Date**: 2026-08-27
+- **Kernel**: jivanshc/graph-r1-reproduction-2wikimultihopqa v2
+- **Fixes applied**: PyTorch downgrade for P100, total_memory attribute fix, correct branch clone
+- **Known issue**: PyTorch module caching means downgrade may not take effect mid-process
+- **Status**: Running (checking for results)
+
+### Run 3: 2WikiMultiHopQA - v3 (PENDING)
+- **Fixes**: Pre-import GPU check via nvidia-smi, float16 fallback for P100/T4
+- **Ready to submit if v2 fails**
