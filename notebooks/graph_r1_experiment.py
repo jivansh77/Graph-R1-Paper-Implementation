@@ -46,6 +46,9 @@ def check_gpu_and_fix_torch():
                                     "--index-url",
                                     "https://download.pytorch.org/whl/cu121"],
                                    capture_output=True, timeout=600)
+                    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y",
+                                    "torchao"],
+                                   capture_output=True, timeout=60)
                     print("PyTorch stack downgraded for P100 compatibility")
     except Exception as e:
         print(f"GPU check skipped: {e}")
