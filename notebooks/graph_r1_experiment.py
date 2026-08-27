@@ -22,6 +22,22 @@ import sys
 import os
 
 def install_packages():
+    import torch as _t
+    needs_torch_reinstall = False
+    if _t.cuda.is_available():
+        try:
+            cap = _t.cuda.get_device_capability(0)
+            if cap[0] < 7:
+                needs_torch_reinstall = True
+                print(f"GPU capability {cap} < 7.0, downgrading PyTorch for compatibility...")
+        except Exception:
+            pass
+
+    if needs_torch_reinstall:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                        "torch==2.4.0", "--index-url", "https://download.pytorch.org/whl/cu121"],
+                       capture_output=True)
+
     packages = [
         "transformers>=4.40.0",
         "datasets>=2.18.0",
@@ -34,6 +50,7 @@ def install_packages():
         "nltk>=3.8.0",
         "sentence-transformers>=2.5.0",
         "openai>=1.12.0",
+        "matplotlib",
     ]
     for pkg in packages:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg],
@@ -41,10 +58,10 @@ def install_packages():
 
 install_packages()
 
-# Clone our repo if not already present
+# Clone our repo (use the feature branch with all code)
 REPO_DIR = "/kaggle/working/Graph-R1-Paper-Implementation"
 if not os.path.exists(REPO_DIR):
-    subprocess.run(["git", "clone",
+    subprocess.run(["git", "clone", "-b", "claude/graph-r1-reproduction-h5n4un",
                      "https://github.com/jivansh77/Graph-R1-Paper-Implementation.git",
                      REPO_DIR], capture_output=True)
 
@@ -62,7 +79,9 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    props = torch.cuda.get_device_properties(0)
+    total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
+    print(f"GPU Memory: {total_mem / 1e9:.1f} GB")
 
 from graph_r1.data import (
     DATASETS, load_flashrag_dataset, format_for_training,
