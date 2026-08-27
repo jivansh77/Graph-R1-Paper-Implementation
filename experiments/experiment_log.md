@@ -49,13 +49,40 @@
 - **Root cause**: Kaggle's default PyTorch requires CUDA capability >= 7.0, P100 has 6.0
 - **Additional error**: `total_mem` attribute renamed to `total_memory` in newer PyTorch
 
-### Run 2: 2WikiMultiHopQA - v2 (IN PROGRESS)
+### Run 2: 2WikiMultiHopQA - v2 (FAILED)
 - **Date**: 2026-08-27
-- **Kernel**: jivanshc/graph-r1-reproduction-2wikimultihopqa v2
-- **Fixes applied**: PyTorch downgrade for P100, total_memory attribute fix, correct branch clone
-- **Known issue**: PyTorch module caching means downgrade may not take effect mid-process
-- **Status**: Running (checking for results)
+- **Error**: PyTorch module caching, no test split in FlashRAG
+- **Fixes**: Moved GPU check before torch import, dev split fallback
 
-### Run 3: 2WikiMultiHopQA - v3 (PENDING)
-- **Fixes**: Pre-import GPU check via nvidia-smi, float16 fallback for P100/T4
-- **Ready to submit if v2 fails**
+### Run 3: 2WikiMultiHopQA - v3 (FAILED)
+- **Error**: `RuntimeError: operator torchvision::nms does not exist`
+- **Fix**: Install torchvision==0.19.0 + torchaudio==2.4.0 matching torch 2.4.0
+
+### Run 4: 2WikiMultiHopQA - v4 (FAILED)
+- **Error**: `TypeError: BertModel.__init__() got an unexpected keyword argument 'dtype'`
+- **Fix**: Removed transformers version pin
+
+### Run 5: 2WikiMultiHopQA - v5 (FAILED)
+- **Error**: `ImportError: incompatible torchao version`
+- **Fix**: Uninstall torchao after torch downgrade
+
+### Run 6: 2WikiMultiHopQA - v6 (FAILED - OOM)
+- **Date**: 2026-08-27
+- **Runtime**: ~93 minutes (5600s)
+- **Progress**: Successfully completed data prep, hypergraph (25163 entities, 18544 hyperedges), embeddings, model loading, and 80+ GRPO training steps
+- **Training observations**:
+  - Rewards improving: -1.0 → -0.8333 (step 40) → -0.6667 (step 60)
+  - Eval F1 remained 0.0 (model hasn't learned format yet)
+  - Each step ~40s, eval ~7min
+- **Error**: `torch.OutOfMemoryError: CUDA out of memory` at step ~85
+- **Root cause**: compute_policy_loss accumulated all rollout loss tensors keeping full computational graphs in memory; no gradient checkpointing; no cache clearing
+
+### Run 7: 2WikiMultiHopQA - v7 (IN PROGRESS)
+- **Date**: 2026-08-27
+- **Fixes**:
+  - Per-rollout backward (free graph after each rollout instead of accumulating)
+  - Gradient checkpointing enabled
+  - torch.cuda.empty_cache() after generation, training, and eval
+  - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  - Reduced max_prompt_length=2048, max_response_length=1024
+  - Reduced mid-training eval from 32 to 16 samples
