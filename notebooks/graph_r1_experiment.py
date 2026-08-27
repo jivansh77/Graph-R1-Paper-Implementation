@@ -160,7 +160,12 @@ try:
     }
 
     hf_key = hf_name_map.get(dataset_name, dataset_name.lower())
-    ds = load_dataset("RUC-NLPIR/FlashRAG_datasets", hf_key, trust_remote_code=True)
+    ds = load_dataset("RUC-NLPIR/FlashRAG_datasets", hf_key)
+
+    # Print dataset schema for debugging
+    first_split = list(ds.keys())[0]
+    print(f"  Available splits: {list(ds.keys())}")
+    print(f"  Columns in {first_split}: {ds[first_split].column_names}")
 
     for split_name in ds:
         output_path = os.path.join(raw_dir, f"{split_name}.json")
@@ -171,20 +176,30 @@ try:
                     "question": item.get("question", ""),
                     "golden_answers": item.get("golden_answers", item.get("answer", [])),
                 }
-                if "gold_context" in item:
-                    entry["gold_context"] = item["gold_context"]
+                # Extract context from metadata (FlashRAG stores it there)
+                meta = item.get("metadata", {})
+                if isinstance(meta, dict):
+                    ctx = meta.get("context", {})
+                    if isinstance(ctx, dict) and "content" in ctx:
+                        titles = ctx.get("title", [])
+                        contents = ctx.get("content", [])
+                        passages = []
+                        for j, content_item in enumerate(contents):
+                            title = titles[j] if j < len(titles) else ""
+                            if isinstance(content_item, list):
+                                text = " ".join(content_item)
+                            else:
+                                text = str(content_item)
+                            if text.strip():
+                                passages.append({"title": title, "text": text})
+                        if passages:
+                            entry["gold_context"] = passages
                 data.append(entry)
             with open(output_path, "w") as f:
                 json.dump(data, f)
             print(f"  Saved {len(data)} {split_name} examples")
         else:
             print(f"  {split_name}.json already exists")
-
-    corpus_path = os.path.join(DATA_DIR, dataset_name, "corpus.jsonl")
-    if not os.path.exists(corpus_path) and "corpus" in ds:
-        with open(corpus_path, "w") as f:
-            for item in ds["corpus"]:
-                f.write(json.dumps(item) + "\n")
 
 except Exception as e:
     print(f"Download error: {e}")
@@ -193,7 +208,18 @@ except Exception as e:
 # Format for training
 print("Formatting data for training...")
 train_data_raw = load_flashrag_dataset(DATA_DIR, dataset_name, "train")
-test_data_raw = load_flashrag_dataset(DATA_DIR, dataset_name, "test")
+
+# FlashRAG datasets may have dev instead of test
+for test_split in ["test", "dev"]:
+    try:
+        test_data_raw = load_flashrag_dataset(DATA_DIR, dataset_name, test_split)
+        print(f"Using {test_split} split for evaluation")
+        break
+    except FileNotFoundError:
+        continue
+else:
+    print("WARNING: No test/dev split found, using last 128 train samples")
+    test_data_raw = train_data_raw[-128:]
 
 train_data = format_for_training(
     train_data_raw, dataset_name, "train",
@@ -216,31 +242,55 @@ print("\n--- Step 2: Knowledge Hypergraph Construction ---")
 hg_dir = os.path.join(EXPERIMENT_DIR, dataset_name)
 hg = KnowledgeHyperGraph(working_dir=hg_dir)
 
-# Collect documents from training data contexts
+# Collect documents for hypergraph construction
 documents = []
-for item in train_data_raw[:EXPERIMENT_CONFIG["train_samples"]]:
-    ctx = item.get("gold_context", item.get("context", ""))
-    if isinstance(ctx, list):
-        for c in ctx:
-            if isinstance(c, dict):
-                text = c.get("content", c.get("text", str(c)))
-            else:
-                text = str(c)
-            if text.strip() and len(text) > 50:
-                documents.append(text)
-    elif isinstance(ctx, str) and ctx.strip() and len(ctx) > 50:
-        documents.append(ctx)
 
-# Also try corpus
+# Source 1: gold_context or context fields from training data
+for item in train_data_raw[:EXPERIMENT_CONFIG["train_samples"]]:
+    for ctx_key in ["gold_context", "context", "supporting_facts", "ctxs"]:
+        ctx = item.get(ctx_key)
+        if ctx is None:
+            continue
+        if isinstance(ctx, list):
+            for c in ctx:
+                if isinstance(c, dict):
+                    text = c.get("content", c.get("text", c.get("title", "")))
+                    if isinstance(text, str) and len(text) > 50:
+                        documents.append(text)
+                elif isinstance(c, str) and len(c) > 50:
+                    documents.append(c)
+        elif isinstance(ctx, str) and len(ctx) > 50:
+            documents.append(ctx)
+
+# Source 2: corpus file
 corpus_path = os.path.join(DATA_DIR, dataset_name, "corpus.jsonl")
 if os.path.exists(corpus_path):
+    corpus_count = 0
+    max_corpus_docs = 5000
     with open(corpus_path) as f:
         for line in f:
+            if corpus_count >= max_corpus_docs:
+                break
             if line.strip():
                 item = json.loads(line)
                 text = item.get("contents", item.get("content", item.get("text", "")))
-                if text.strip() and len(text) > 50:
+                if isinstance(text, str) and len(text) > 50:
                     documents.append(text)
+                    corpus_count += 1
+    print(f"  Loaded {corpus_count} documents from corpus")
+
+# Source 3: If no documents found, build synthetic corpus from questions+answers
+if len(documents) == 0:
+    print("  No corpus or context available — building from question-answer data")
+    for item in train_data_raw[:EXPERIMENT_CONFIG["train_samples"]]:
+        q = item.get("question", "")
+        answers = item.get("golden_answers", item.get("answer", []))
+        if isinstance(answers, str):
+            answers = [answers]
+        for ans in answers:
+            doc = f"{q} The answer is {ans}."
+            if len(doc) > 30:
+                documents.append(doc)
 
 # Deduplicate
 documents = list(set(documents))
