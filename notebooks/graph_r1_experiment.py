@@ -55,6 +55,8 @@ def check_gpu_and_fix_torch():
 
 check_gpu_and_fix_torch()
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 def install_packages():
     packages = [
         "transformers>=4.40.0",
@@ -392,6 +394,8 @@ config = GRPOConfig(
     mini_batch_size=EXPERIMENT_CONFIG["mini_batch_size"],
     num_rollouts=EXPERIMENT_CONFIG["num_rollouts"],
     max_turns=EXPERIMENT_CONFIG["max_turns"],
+    max_prompt_length=2048,
+    max_response_length=1024,
     num_epochs=EXPERIMENT_CONFIG["num_epochs"],
     eval_steps=EXPERIMENT_CONFIG["eval_steps"],
     save_steps=EXPERIMENT_CONFIG["save_steps"],

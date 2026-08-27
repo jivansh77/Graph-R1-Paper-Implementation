@@ -99,6 +99,7 @@ class GRPOTrainer:
             self.model = get_peft_model(self.model, lora_config)
             self.model.print_trainable_parameters()
 
+        self.model.gradient_checkpointing_enable()
         self.model.to(self.device)
 
         self.ref_model = AutoModelForCausalLM.from_pretrained(
@@ -199,6 +200,8 @@ class GRPOTrainer:
             all_rollouts.extend(prompt_rollouts)
 
         self.model.train()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return all_rollouts
 
     def compute_advantages(self, rollouts: list[dict]) -> list[dict]:
@@ -220,10 +223,14 @@ class GRPOTrainer:
 
         return rollouts
 
-    def compute_policy_loss(self, rollouts: list[dict]) -> torch.Tensor:
-        """Compute the GRPO clipped policy loss with KL regularization."""
-        total_loss = torch.tensor(0.0, device=self.device)
+    def compute_policy_loss(self, rollouts: list[dict]) -> float:
+        """Compute the GRPO clipped policy loss with KL regularization.
+
+        Uses per-rollout backward to avoid accumulating computational graphs.
+        """
+        total_loss_scalar = 0.0
         num_valid = 0
+        max_seq = self.config.max_prompt_length + self.config.max_response_length
 
         for rollout in rollouts:
             prompt_text = rollout["prompt"]
@@ -235,7 +242,7 @@ class GRPOTrainer:
                 full_text,
                 return_tensors="pt",
                 truncation=True,
-                max_length=self.config.max_prompt_length + self.config.max_response_length,
+                max_length=max_seq,
             ).to(self.device)
 
             prompt_encoding = self.tokenizer(
@@ -256,11 +263,13 @@ class GRPOTrainer:
                 ref_log_probs = F.log_softmax(ref_logits, dim=-1)
                 response_tokens = encoding["input_ids"][:, prompt_len:]
                 ref_token_log_probs = ref_log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
+                del ref_outputs, ref_logits, ref_log_probs
 
             outputs = self.model(**encoding)
             logits = outputs.logits[:, prompt_len - 1:-1, :]
             log_probs = F.log_softmax(logits, dim=-1)
             token_log_probs = log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
+            del outputs, logits, log_probs
 
             ratio = torch.exp(token_log_probs - ref_token_log_probs.detach())
 
@@ -274,38 +283,47 @@ class GRPOTrainer:
             kl_div = (ref_token_log_probs.detach() - token_log_probs).mean()
             loss = pg_loss + self.config.kl_coeff * kl_div
 
-            total_loss = total_loss + loss
+            scaled_loss = loss / len(rollouts)
+            scaled_loss.backward()
+            total_loss_scalar += loss.item()
             num_valid += 1
 
-        if num_valid > 0:
-            total_loss = total_loss / num_valid
+            del encoding, token_log_probs, ref_token_log_probs, ratio, loss, scaled_loss
 
-        return total_loss
+        if num_valid > 0:
+            total_loss_scalar /= num_valid
+
+        return total_loss_scalar
 
     def train_step(self, batch_prompts: list[str], batch_gts: list) -> dict:
         """Execute one GRPO training step.
 
         1. Generate N rollouts per prompt
         2. Compute rewards and advantages
-        3. Update policy with clipped loss + KL
+        3. Update policy with clipped loss + KL (per-rollout backward)
         """
         rollouts = self.generate_rollouts(batch_prompts, batch_gts)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         rollouts = self.compute_advantages(rollouts)
 
         self.model.train()
         self.optimizer.zero_grad()
 
-        loss = self.compute_policy_loss(rollouts)
-        loss.backward()
+        loss_value = self.compute_policy_loss(rollouts)
 
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
         self.optimizer.step()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         rewards = [r["reward"] for r in rollouts]
         advantages = [r["advantage"] for r in rollouts]
 
         metrics = {
-            "loss": loss.item(),
+            "loss": loss_value,
             "mean_reward": np.mean(rewards),
             "std_reward": np.std(rewards),
             "mean_advantage": np.mean(advantages),
@@ -363,8 +381,10 @@ class GRPOTrainer:
 
                 if self.config.eval_steps and self.global_step % self.config.eval_steps == 0:
                     if eval_data:
-                        eval_metrics = self.evaluate(eval_data[:32])
+                        eval_metrics = self.evaluate(eval_data[:16])
                         print(f"  Eval F1: {eval_metrics.get('f1', 0):.4f}")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                 if self.config.save_steps and self.global_step % self.config.save_steps == 0:
                     self.save_checkpoint()
