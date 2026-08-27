@@ -336,17 +336,26 @@ class GRPOTrainer:
 
         return metrics
 
-    def train(self, train_data: list[dict], eval_data: list[dict] | None = None) -> list[dict]:
+    def train(self, train_data: list[dict], eval_data: list[dict] | None = None,
+              max_train_hours: float = 7.0) -> list[dict]:
         """Full training loop over the dataset."""
         os.makedirs(self.config.output_dir, exist_ok=True)
 
         num_batches = len(train_data) // self.config.batch_size
         all_metrics = []
+        train_start = time.time()
 
         for epoch in range(self.config.num_epochs):
             indices = np.random.permutation(len(train_data))
 
             for batch_idx in range(num_batches):
+                elapsed_hours = (time.time() - train_start) / 3600
+                if elapsed_hours >= max_train_hours:
+                    print(f"Training time limit ({max_train_hours}h) reached at step {self.global_step}. Stopping to allow evaluation.")
+                    self.save_checkpoint()
+                    self.save_training_log()
+                    return all_metrics
+
                 start = batch_idx * self.config.batch_size
                 end = start + self.config.batch_size
                 batch_indices = indices[start:end]
