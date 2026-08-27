@@ -39,12 +39,17 @@ def check_gpu_and_fix_torch():
                 cap_str = parts[1].strip()
                 major = int(cap_str.split(".")[0])
                 if major < 7:
-                    print(f"GPU compute capability {cap_str} < 7.0, installing compatible PyTorch...")
+                    print(f"GPU compute capability {cap_str} < 7.0, installing compatible PyTorch stack...")
                     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                                    "torch==2.4.0", "--index-url",
+                                    "torch==2.4.0", "torchvision==0.19.0",
+                                    "torchaudio==2.4.0",
+                                    "--index-url",
                                     "https://download.pytorch.org/whl/cu121"],
                                    capture_output=True, timeout=600)
-                    print("PyTorch downgraded to 2.4.0+cu121 for P100 compatibility")
+                    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                                    "transformers>=4.40.0,<4.46.0"],
+                                   capture_output=True, timeout=300)
+                    print("PyTorch stack downgraded for P100 compatibility")
     except Exception as e:
         print(f"GPU check skipped: {e}")
 
