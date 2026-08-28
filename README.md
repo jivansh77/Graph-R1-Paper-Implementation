@@ -207,12 +207,12 @@ Six standard RAG benchmarks from FlashRAG (5,120 train / 128 test each):
 
 ### 2WikiMultiHopQA (Qwen2.5-1.5B-Instruct)
 
-| Metric | Paper | Ours | Gap |
-|--------|-------|------|-----|
-| EM     | 35.13 | TBD  | —   |
-| F1     | 65.73 | TBD  | —   |
+| Metric | Paper | Ours (v9) | Gap |
+|--------|-------|-----------|-----|
+| EM     | 35.13 | 0.0       | -35.13 |
+| F1     | 65.73 | 0.0       | -65.73 |
 
-*Results pending — v9 run in progress (2026-08-28). See `experiments/experiment_log.md` for full run history.*
+*Current results reflect significant compute gap (single P100 16GB + LoRA vs 4x A100 80GB + full params). v10 with SFT warmup + few-shot prompting pending GPU quota reset. See `experiments/experiment_log.md` for the full 9-run iteration log.*
 
 ### Training Observations
 
@@ -240,6 +240,20 @@ Over 9 iterations, key findings on adapting Graph-R1 for single-GPU LoRA trainin
 | Framework | VERL + Ray distributed | Custom single-GPU PyTorch |
 
 These differences primarily affect training scale and graph construction quality, but the core algorithm (GRPO with format+answer rewards over hypergraph retrieval) is faithfully implemented.
+
+## Challenges & Lessons Learned
+
+Reproducing Graph-R1 on Kaggle's free tier (P100 16GB) revealed several insights about RL-based RAG training at constrained scale:
+
+1. **LoRA LR must be ~40x higher than full-param LR**: The paper's 5e-7 produced zero learning with LoRA. Standard LoRA LR of 2e-5 was needed — a known LoRA best practice, but easy to miss when following a paper's hyperparameters.
+
+2. **Exploration is the bottleneck, not optimization**: With the LR fixed, the model quickly learned the easy pattern (`<think>` + `<answer>`) but never discovered `<query>` usage for retrieval. RL can only reinforce behaviors the model sometimes produces — it can't teach genuinely new behaviors from scratch.
+
+3. **SFT warmup is essential for format learning**: A brief supervised phase teaching the expected output format (think→query→answer) provides the behavioral anchoring that RL then refines. Without it, the model settles into a local optimum of format-correct but content-wrong outputs.
+
+4. **Reward sparsity compounds with compute constraints**: The paper's indicator function `𝟙{R_format=1}` requires multi-turn format perfection before answer quality matters. With limited rollouts and training steps, this creates a chicken-and-egg problem — lowering the threshold to 0.5 gives earlier answer feedback.
+
+5. **Memory management requires architectural changes**: Simply reducing batch sizes isn't enough for 16GB VRAM. Per-rollout backward passes (freeing computational graphs after each), gradient checkpointing, and aggressive cache clearing are all necessary.
 
 ## Evaluation Metrics
 

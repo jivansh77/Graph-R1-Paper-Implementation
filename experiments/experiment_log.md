@@ -94,12 +94,25 @@
   3. **Advantage signal killed**: With most rollouts getting -1.0 and group normalization, advantages were ~1e-16 (floating point noise).
 - **Training dynamics**: Mean reward oscillated -1.0 to -0.75. Model occasionally produced `<think>`+`<answer>` (reward=-0.5) but gradient signal too weak to reinforce.
 
-### Run 9: 2WikiMultiHopQA - v9 (IN PROGRESS)
+### Run 9: 2WikiMultiHopQA - v9 (COMPLETED - 0% results)
 - **Date**: 2026-08-28
+- **Runtime**: 5.4 hours (19,359s)
+- **Config**: 512 train samples, LR=2e-5, format_threshold=0.5, cosine scheduler
+- **Hypergraph**: 15,792 entities, 9,747 hyperedges
+- **Training**: 256 steps completed
+- **Results**: EM=0.0%, F1=0.0%
+- **Progress vs v8**:
+  - Losses now meaningful (1e-3 to 1e-2 range vs v8's ~1e-7) — LR fix worked
+  - Model learned `<think>`+`<answer>` format consistently (max_reward always -0.5)
+  - Mean reward improved to -0.58 to -0.75 range (vs -0.83 to -1.0 in v8)
+- **Root cause**: Model produces `<answer>` tags but content has 0% F1. Never learned to use `<query>` tags for retrieval. Without retrieval, the 1.5B model can't answer multi-hop questions from its own knowledge. Local optimum: format-correct, content-wrong.
+- **Diagnosis**: The instruction template describes the format but doesn't show an example. The model learns the easy part (think+answer) but never discovers the harder pattern (think+query→retrieve→think+answer).
+
+### Run 10: 2WikiMultiHopQA - v10 (PENDING - GPU quota exhausted)
+- **Date**: 2026-08-28
+- **Status**: Code ready, awaiting Kaggle GPU quota reset (30h/week limit reached)
 - **Fixes**:
-  - LR: 5e-7 → 2e-5 (standard for LoRA fine-tuning)
-  - Format threshold: 1.0 → 0.5 (single-turn think+answer unlocks answer credit)
-  - Cosine LR scheduler (2e-5 → 1e-6)
-  - Training samples: 256 → 512 (more training signal)
-  - Eval/save intervals widened to save time
-  - Enhanced logging: max_reward, LR per step, 3-panel training curves
+  - Few-shot prompt: Concrete example in instruction template showing the full think→query→knowledge→think→answer pattern
+  - SFT warmup: 30 steps of supervised fine-tuning before RL, alternating between query-generation and answer-generation targets
+  - Debug output: First 3 rollout responses and eval predictions logged with ground truth
+- **Expected impact**: SFT warmup should teach the model to produce `<query>` tags, enabling retrieval during RL rollouts and giving the model access to knowledge needed for correct answers
