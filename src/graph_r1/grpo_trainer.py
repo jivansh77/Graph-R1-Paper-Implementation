@@ -68,16 +68,19 @@ class GRPOTrainer:
     def __init__(self, config: GRPOConfig, retriever=None):
         self.config = config
         self.retriever = retriever
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device, self.device_type = self._detect_device()
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        dtype = torch.float32
-        if torch.cuda.is_available():
+        if self.device_type == "tpu":
+            dtype = torch.bfloat16
+        elif self.device_type == "cuda":
             cap = torch.cuda.get_device_capability(0)
             dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+        else:
+            dtype = torch.float32
 
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
@@ -120,6 +123,30 @@ class GRPOTrainer:
 
         self.global_step = 0
         self.training_log = []
+
+    @staticmethod
+    def _detect_device():
+        """Detect the best available device: TPU > CUDA > CPU."""
+        try:
+            import torch_xla.core.xla_model as xm
+            device = xm.xla_device()
+            print(f"Using TPU device")
+            return device, "tpu"
+        except (ImportError, RuntimeError):
+            pass
+        if torch.cuda.is_available():
+            print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+            return torch.device("cuda"), "cuda"
+        print("Using CPU")
+        return torch.device("cpu"), "cpu"
+
+    def _sync_device(self):
+        """Synchronize and clean up device state."""
+        if self.device_type == "tpu":
+            import torch_xla.core.xla_model as xm
+            xm.mark_step()
+        elif self.device_type == "cuda":
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def generate_rollouts(self, prompts: list[str], ground_truths: list) -> list[dict]:
@@ -206,8 +233,7 @@ class GRPOTrainer:
             all_rollouts.extend(prompt_rollouts)
 
         self.model.train()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._sync_device()
         return all_rollouts
 
     def compute_advantages(self, rollouts: list[dict]) -> list[dict]:
@@ -309,8 +335,7 @@ class GRPOTrainer:
         3. Update policy with clipped loss + KL (per-rollout backward)
         """
         rollouts = self.generate_rollouts(batch_prompts, batch_gts)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._sync_device()
 
         rollouts = self.compute_advantages(rollouts)
 
@@ -324,8 +349,7 @@ class GRPOTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._sync_device()
 
         rewards = [r["reward"] for r in rollouts]
         advantages = [r["advantage"] for r in rollouts]
@@ -399,14 +423,14 @@ class GRPOTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
+            self._sync_device()
 
             if step % 5 == 0:
                 print(f"  SFT step {step}: loss={loss.item():.4f}")
 
             del encoding, outputs, logits, loss
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._sync_device()
         print("SFT warmup complete.\n")
 
     def train(self, train_data: list[dict], eval_data: list[dict] | None = None,
@@ -471,8 +495,7 @@ class GRPOTrainer:
                     if eval_data:
                         eval_metrics = self.evaluate(eval_data[:16])
                         print(f"  Eval F1: {eval_metrics.get('f1', 0):.4f}")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        self._sync_device()
 
                 if self.config.save_steps and self.global_step % self.config.save_steps == 0:
                     self.save_checkpoint()

@@ -108,11 +108,14 @@
 - **Root cause**: Model produces `<answer>` tags but content has 0% F1. Never learned to use `<query>` tags for retrieval. Without retrieval, the 1.5B model can't answer multi-hop questions from its own knowledge. Local optimum: format-correct, content-wrong.
 - **Diagnosis**: The instruction template describes the format but doesn't show an example. The model learns the easy part (think+answer) but never discovers the harder pattern (think+query→retrieve→think+answer).
 
-### Run 10: 2WikiMultiHopQA - v10 (PENDING - GPU quota exhausted)
+### Run 10: 2WikiMultiHopQA - v10 (PENDING - switched to TPU)
 - **Date**: 2026-08-28
-- **Status**: Code ready, awaiting Kaggle GPU quota reset (30h/week limit reached)
+- **Status**: Pushed to Kaggle with TPU accelerator (GPU quota exhausted at 30h/week)
+- **Hardware**: Kaggle TPU v3-8 (8 cores, 128GB HBM total) via PyTorch/XLA
 - **Fixes**:
   - Few-shot prompt: Concrete example in instruction template showing the full think→query→knowledge→think→answer pattern
   - SFT warmup: 30 steps of supervised fine-tuning before RL, alternating between query-generation and answer-generation targets
   - Debug output: First 3 rollout responses and eval predictions logged with ground truth
-- **Expected impact**: SFT warmup should teach the model to produce `<query>` tags, enabling retrieval during RL rollouts and giving the model access to knowledge needed for correct answers
+  - TPU support: Device-agnostic trainer with automatic TPU/GPU/CPU detection, bfloat16 on TPU, XLA mark_step synchronization
+  - Embeddings run on CPU (FAISS and FlagEmbedding don't support XLA), model training on TPU
+- **Expected impact**: SFT warmup should teach the model to produce `<query>` tags, enabling retrieval during RL rollouts and giving the model access to knowledge needed for correct answers. TPU bfloat16 may also help with training stability compared to GPU float16.

@@ -1,14 +1,14 @@
 """
 Graph-R1 Full Experiment Pipeline - Kaggle Notebook Script
 
-This script is designed to run as a Kaggle notebook with GPU acceleration.
+This script is designed to run as a Kaggle notebook with TPU or GPU acceleration.
 It implements the complete Graph-R1 pipeline:
 1. Data preparation (download + format FlashRAG datasets)
 2. Knowledge Hypergraph construction (chunking + extraction + embedding)
 3. GRPO Training on Qwen2.5-1.5B-Instruct
 4. Evaluation on all 6 benchmarks
 
-Hardware: Kaggle GPU (T4 16GB or P100 16GB)
+Hardware: Kaggle TPU v3-8 (preferred) or GPU (T4/P100 16GB)
 Expected runtime: ~4-6 hours for 1.5B model on 1 dataset
 """
 
@@ -21,12 +21,23 @@ import subprocess
 import sys
 import os
 
-def check_gpu_and_fix_torch():
-    """Check GPU compatibility BEFORE importing torch.
+def setup_accelerator():
+    """Detect and configure the best available accelerator.
 
-    P100 (sm_60) is not supported by PyTorch >= 2.5 compiled for cu128+.
-    We detect this via nvidia-smi and downgrade torch before any import.
+    TPU: Uses pre-installed torch_xla, no setup needed.
+    GPU: Detects P100 (sm_60) and downgrades torch for compatibility.
+    CPU: Fallback with no special setup.
     """
+    # Check for TPU first (torch_xla is pre-installed on Kaggle TPU kernels)
+    try:
+        import torch_xla.core.xla_model as xm
+        device = xm.xla_device()
+        print(f"TPU detected: {device}")
+        return "tpu"
+    except (ImportError, RuntimeError):
+        pass
+
+    # Check for GPU
     try:
         result = subprocess.run(["nvidia-smi", "--query-gpu=name,compute_cap",
                                  "--format=csv,noheader"],
@@ -50,12 +61,17 @@ def check_gpu_and_fix_torch():
                                     "torchao"],
                                    capture_output=True, timeout=60)
                     print("PyTorch stack downgraded for P100 compatibility")
+            return "gpu"
     except Exception as e:
         print(f"GPU check skipped: {e}")
 
-check_gpu_and_fix_torch()
+    print("No accelerator detected, using CPU")
+    return "cpu"
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+accelerator_type = setup_accelerator()
+
+if accelerator_type == "gpu":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def install_packages():
     packages = [
@@ -96,8 +112,13 @@ import torch
 from datetime import datetime
 
 print(f"PyTorch version: {torch.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
+print(f"Accelerator: {accelerator_type}")
+if accelerator_type == "tpu":
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    print(f"TPU device: {xm.xla_device()}")
+    print(f"torch_xla version: {torch_xla.__version__}")
+elif torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     props = torch.cuda.get_device_properties(0)
     total_mem = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
@@ -346,9 +367,9 @@ print(f"Extraction done in {extraction_time:.1f}s: {len(hg.entities)} entities, 
 
 # Build embeddings
 print("Building embeddings with bge-large-en-v1.5...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+embed_device = "cuda" if torch.cuda.is_available() else "cpu"
 t0 = time.time()
-hg.build_embeddings(device=device)
+hg.build_embeddings(device=embed_device)
 embed_time = time.time() - t0
 print(f"Embeddings built in {embed_time:.1f}s")
 
@@ -368,7 +389,7 @@ from FlagEmbedding import FlagAutoModel
 embedding_model = FlagAutoModel.from_finetuned(
     'BAAI/bge-large-en-v1.5',
     query_instruction_for_retrieval="Represent this sentence for searching relevant passages: ",
-    devices=device,
+    devices=embed_device,
 )
 
 retriever = HypergraphRetriever(hg, embedding_model=embedding_model)
