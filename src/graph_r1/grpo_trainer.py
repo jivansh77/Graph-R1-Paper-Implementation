@@ -149,18 +149,34 @@ class GRPOTrainer:
         elif self.device_type == "cuda":
             torch.cuda.empty_cache()
 
+    def _move_for_generation(self):
+        """Move model to CPU for generation on TPU (XLA is extremely slow for autoregressive generation)."""
+        if self.device_type == "tpu":
+            self.model.to(torch.device("cpu"))
+            import gc; gc.collect()
+            return torch.device("cpu")
+        return self.device
+
+    def _move_for_training(self):
+        """Move model back to training device after generation."""
+        if self.device_type == "tpu":
+            self.model.to(self.device)
+            self._sync_device()
+
     @torch.no_grad()
     def generate_rollouts(self, prompts: list[str], ground_truths: list) -> list[dict]:
         """Generate N rollout trajectories per prompt using the current policy.
 
         For each prompt, generates num_rollouts completions with multi-turn
-        retrieval interaction.
+        retrieval interaction. On TPU, generation runs on CPU (XLA is
+        extremely slow for autoregressive decoding due to per-token recompilation).
         """
         from .agent import ToolEnv
         from .rewards import compute_reward
 
         all_rollouts = []
         self.model.eval()
+        gen_device = self._move_for_generation()
 
         for prompt_idx, (prompt, gt) in enumerate(zip(prompts, ground_truths)):
             prompt_rollouts = []
@@ -185,7 +201,7 @@ class GRPOTrainer:
                         return_tensors="pt",
                         truncation=True,
                         max_length=self.config.max_prompt_length,
-                    ).to(self.device)
+                    ).to(gen_device)
 
                     with torch.no_grad():
                         outputs = self.model.generate(
@@ -214,6 +230,8 @@ class GRPOTrainer:
                         current_text = current_text + response + obs_text
                         full_response += obs_text
 
+                    del inputs, outputs
+
                 solution = prompt + full_response
                 reward = compute_reward(solution, gt)
 
@@ -233,6 +251,7 @@ class GRPOTrainer:
 
             all_rollouts.extend(prompt_rollouts)
 
+        self._move_for_training()
         self.model.train()
         self._sync_device()
         return all_rollouts
@@ -511,6 +530,7 @@ class GRPOTrainer:
         from .rewards import compute_f1, compute_em, extract_answer
 
         self.model.eval()
+        gen_device = self._move_for_generation()
         predictions = []
         references = []
 
@@ -529,7 +549,7 @@ class GRPOTrainer:
                     return_tensors="pt",
                     truncation=True,
                     max_length=self.config.max_prompt_length,
-                ).to(self.device)
+                ).to(gen_device)
 
                 outputs = self.model.generate(
                     **inputs,
@@ -541,6 +561,8 @@ class GRPOTrainer:
                     outputs[0][inputs["input_ids"].shape[1]:],
                     skip_special_tokens=False,
                 )
+                del inputs, outputs
+
                 eos_token = self.tokenizer.eos_token or "<|im_end|>"
                 if eos_token in response:
                     response = response[:response.index(eos_token)]
@@ -567,6 +589,8 @@ class GRPOTrainer:
             if len(predictions) <= 3:
                 gt_str = gt[0] if isinstance(gt, list) else gt
                 print(f"  [Eval sample {len(predictions)}] Pred: '{answer[:80]}' | Gold: '{gt_str[:80]}'")
+
+        self._move_for_training()
 
         em_scores = []
         f1_scores = []

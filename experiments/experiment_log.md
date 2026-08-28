@@ -108,14 +108,28 @@
 - **Root cause**: Model produces `<answer>` tags but content has 0% F1. Never learned to use `<query>` tags for retrieval. Without retrieval, the 1.5B model can't answer multi-hop questions from its own knowledge. Local optimum: format-correct, content-wrong.
 - **Diagnosis**: The instruction template describes the format but doesn't show an example. The model learns the easy part (think+answer) but never discovers the harder pattern (think+query→retrieve→think+answer).
 
-### Run 10: 2WikiMultiHopQA - v10 (PENDING - switched to TPU)
+### Runs 10-12: TPU Gradient Checkpointing Fixes (FAILED)
 - **Date**: 2026-08-28
-- **Status**: Pushed to Kaggle with TPU accelerator (GPU quota exhausted at 30h/week)
-- **Hardware**: Kaggle TPU v3-8 (8 cores, 128GB HBM total) via PyTorch/XLA
-- **Fixes**:
-  - Few-shot prompt: Concrete example in instruction template showing the full think→query→knowledge→think→answer pattern
-  - SFT warmup: 30 steps of supervised fine-tuning before RL, alternating between query-generation and answer-generation targets
-  - Debug output: First 3 rollout responses and eval predictions logged with ground truth
-  - TPU support: Device-agnostic trainer with automatic TPU/GPU/CPU detection, bfloat16 on TPU, XLA mark_step synchronization
-  - Embeddings run on CPU (FAISS and FlagEmbedding don't support XLA), model training on TPU
-- **Expected impact**: SFT warmup should teach the model to produce `<query>` tags, enabling retrieval during RL rollouts and giving the model access to knowledge needed for correct answers. TPU bfloat16 may also help with training stability compared to GPU float16.
+- **Error**: torch_xla 2.8.0 is incompatible with gradient checkpointing (multiple paths through `_get_device_module('xla')` fail)
+- **Fixes tried**: use_reentrant=True, preserve_rng_state=False, and finally disabling gradient checkpointing entirely on TPU
+
+### Run 13: 2WikiMultiHopQA - v13 (FAILED - Killed/OOM after 5.7h)
+- **Date**: 2026-08-28
+- **Runtime**: ~5.7 hours (20,587s)
+- **Hardware**: Kaggle TPU v3-8 via PyTorch/XLA 2.8.0
+- **Config**: 512 train samples, LR=2e-5, batch_size=4, mini_batch_size=2, num_rollouts=3
+- **Hypergraph**: 15,792 entities, 9,747 hyperedges
+- **SFT warmup**: Completed successfully in ~22 min (30 steps, loss 0.62→0.41)
+- **Positive**: Model IS now using `<query>` tags after SFT warmup! Rollout output shows: `<think>I need to find...<query>Are Shokrab, Kermanshah...`
+- **Root cause**: XLA autoregressive generation is extremely slow (~24 min per generation vs ~10-20s on CPU). XLA needs to trace/compile each unique graph shape, and autoregressive generation has changing tensor shapes at each token. Eventually killed by OOM after accumulating too much memory during the slow generation.
+- **Fix for v14**: Move model to CPU for generation (rollouts + eval), keep only training forward/backward on TPU
+
+### Run 14: 2WikiMultiHopQA - v14 (PENDING)
+- **Date**: 2026-08-28
+- **Hardware**: Kaggle TPU v3-8
+- **Key change**: Hybrid CPU/TPU approach - generation on CPU, training on TPU
+  - `_move_for_generation()`: moves model to CPU before rollout/eval generation
+  - `_move_for_training()`: moves model back to TPU for forward/backward pass
+  - Expected: ~10-20s per generation on CPU vs ~24 min on TPU/XLA
+  - Model move overhead: ~5-10s each way (1.5B model in bfloat16 ~3GB)
+- **Expected runtime**: ~3-4 hours (SFT 30 min + 256 GRPO steps at ~45s each + eval)
