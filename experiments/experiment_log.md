@@ -77,12 +77,29 @@
 - **Error**: `torch.OutOfMemoryError: CUDA out of memory` at step ~85
 - **Root cause**: compute_policy_loss accumulated all rollout loss tensors keeping full computational graphs in memory; no gradient checkpointing; no cache clearing
 
-### Run 7: 2WikiMultiHopQA - v7 (IN PROGRESS)
+### Run 7: 2WikiMultiHopQA - v7 (SKIPPED)
 - **Date**: 2026-08-27
+- **Note**: Superseded by v8 with reduced training samples
+
+### Run 8: 2WikiMultiHopQA - v8 (COMPLETED - 0% results)
+- **Date**: 2026-08-27
+- **Runtime**: ~3.4 hours
+- **Config**: 256 train samples, batch_size=4, mini_batch_size=2, num_rollouts=3, LR=5e-7
+- **Hypergraph**: 9,525 entities, 5,212 hyperedges
+- **Training**: 128 steps completed
+- **Results**: EM=0.0%, F1=0.0%
+- **Diagnosis**: Three root causes for zero performance:
+  1. **LR too low for LoRA**: 5e-7 (paper's full-param rate) produced losses of ~1e-7, effectively zero parameter updates. LoRA needs ~2e-5.
+  2. **Format reward too sparse**: Required multi-turn format (R_format=1.0) to unlock answer reward. Single-turn think+answer only gets 0.5, so answer F1 never factors in.
+  3. **Advantage signal killed**: With most rollouts getting -1.0 and group normalization, advantages were ~1e-16 (floating point noise).
+- **Training dynamics**: Mean reward oscillated -1.0 to -0.75. Model occasionally produced `<think>`+`<answer>` (reward=-0.5) but gradient signal too weak to reinforce.
+
+### Run 9: 2WikiMultiHopQA - v9 (IN PROGRESS)
+- **Date**: 2026-08-28
 - **Fixes**:
-  - Per-rollout backward (free graph after each rollout instead of accumulating)
-  - Gradient checkpointing enabled
-  - torch.cuda.empty_cache() after generation, training, and eval
-  - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  - Reduced max_prompt_length=2048, max_response_length=1024
-  - Reduced mid-training eval from 32 to 16 samples
+  - LR: 5e-7 → 2e-5 (standard for LoRA fine-tuning)
+  - Format threshold: 1.0 → 0.5 (single-turn think+answer unlocks answer credit)
+  - Cosine LR scheduler (2e-5 → 1e-6)
+  - Training samples: 256 → 512 (more training signal)
+  - Eval/save intervals widened to save time
+  - Enhanced logging: max_reward, LR per step, 3-panel training curves
