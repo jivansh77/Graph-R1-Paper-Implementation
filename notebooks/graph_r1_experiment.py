@@ -117,16 +117,16 @@ from graph_r1.evaluate import evaluate_dataset, format_results_table, save_evalu
 EXPERIMENT_CONFIG = {
     "dataset": "2WikiMultiHopQA",
     "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
-    "train_samples": 256,
+    "train_samples": 512,
     "test_samples": 128,
     "batch_size": 4,
     "mini_batch_size": 2,
     "num_rollouts": 3,
     "max_turns": 3,
     "num_epochs": 1,
-    "learning_rate": 5e-7,
-    "eval_steps": 32,
-    "save_steps": 64,
+    "learning_rate": 2e-5,
+    "eval_steps": 64,
+    "save_steps": 128,
     "use_lora": True,
     "lora_r": 16,
 }
@@ -478,18 +478,23 @@ if training_metrics:
 
     steps = [m["step"] for m in training_metrics]
     rewards = [m["mean_reward"] for m in training_metrics]
+    max_rewards = [m.get("max_reward", m["mean_reward"]) for m in training_metrics]
     losses = [m["loss"] for m in training_metrics]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4))
 
-    ax1.plot(steps, rewards, alpha=0.3, color='blue')
-    window = min(10, len(rewards))
+    ax1.plot(steps, rewards, alpha=0.3, color='blue', label='Mean')
+    ax1.plot(steps, max_rewards, alpha=0.3, color='green', label='Max')
+    window = min(20, len(rewards))
     if window > 1:
         smoothed = np.convolve(rewards, np.ones(window)/window, mode='valid')
         ax1.plot(range(window-1, len(rewards)), smoothed, color='blue', linewidth=2)
+        smoothed_max = np.convolve(max_rewards, np.ones(window)/window, mode='valid')
+        ax1.plot(range(window-1, len(max_rewards)), smoothed_max, color='green', linewidth=2)
     ax1.set_xlabel("Step")
-    ax1.set_ylabel("Mean Reward")
+    ax1.set_ylabel("Reward")
     ax1.set_title(f"Training Reward ({dataset_name})")
+    ax1.legend()
     ax1.grid(True, alpha=0.3)
 
     ax2.plot(steps, losses, alpha=0.3, color='red')
@@ -500,6 +505,13 @@ if training_metrics:
     ax2.set_ylabel("Loss")
     ax2.set_title(f"Training Loss ({dataset_name})")
     ax2.grid(True, alpha=0.3)
+
+    lrs = [m.get("lr", EXPERIMENT_CONFIG["learning_rate"]) for m in training_metrics]
+    ax3.plot(steps, lrs, color='purple')
+    ax3.set_xlabel("Step")
+    ax3.set_ylabel("Learning Rate")
+    ax3.set_title("LR Schedule")
+    ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
     fig_path = os.path.join(EXPERIMENT_DIR, f"{dataset_name}_training_curves.png")

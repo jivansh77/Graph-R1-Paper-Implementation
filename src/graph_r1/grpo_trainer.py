@@ -11,7 +11,7 @@ Key equations:
 - KL regularization toward reference policy
 
 Training hyperparameters from Table 3 / Appendix G:
-- Batch size: 128, LR: 5e-7, Rollout N: 5
+- Batch size: 128, LR: 5e-7 (full-param) / 2e-5 (LoRA), Rollout N: 5
 - Max length: 4096, KL coeff (β): 0.001
 - Clip range (ε): 0.2 (standard)
 """
@@ -35,7 +35,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 class GRPOConfig:
     """Configuration for GRPO training."""
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
-    learning_rate: float = 5e-7
+    learning_rate: float = 2e-5
     batch_size: int = 16
     mini_batch_size: int = 4
     num_rollouts: int = 5
@@ -116,6 +116,7 @@ class GRPOTrainer:
             lr=config.learning_rate,
             weight_decay=0.01,
         )
+        self.scheduler = None
 
         self.global_step = 0
         self.training_log = []
@@ -315,19 +316,24 @@ class GRPOTrainer:
 
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
         self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         rewards = [r["reward"] for r in rollouts]
         advantages = [r["advantage"] for r in rollouts]
+        current_lr = self.optimizer.param_groups[0]["lr"]
 
         metrics = {
             "loss": loss_value,
             "mean_reward": np.mean(rewards),
+            "max_reward": max(rewards),
             "std_reward": np.std(rewards),
             "mean_advantage": np.mean(advantages),
             "num_rollouts": len(rollouts),
+            "lr": current_lr,
             "step": self.global_step,
         }
 
@@ -342,6 +348,12 @@ class GRPOTrainer:
         os.makedirs(self.config.output_dir, exist_ok=True)
 
         num_batches = len(train_data) // self.config.batch_size
+        mini_batches_per_batch = max(1, self.config.batch_size // max(1, self.config.mini_batch_size))
+        total_steps = num_batches * mini_batches_per_batch * self.config.num_epochs
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max(1, total_steps), eta_min=1e-6)
+        print(f"Training plan: {total_steps} steps, LR {self.config.learning_rate} → 1e-6 (cosine)")
+
         all_metrics = []
         train_start = time.time()
 
@@ -383,9 +395,9 @@ class GRPOTrainer:
                     if self.global_step % 10 == 0:
                         print(
                             f"Step {self.global_step} | "
-                            f"Loss: {metrics['loss']:.4f} | "
-                            f"Reward: {metrics['mean_reward']:.4f} | "
-                            f"Std: {metrics['std_reward']:.4f}"
+                            f"Loss: {metrics['loss']:.6f} | "
+                            f"Reward: {metrics['mean_reward']:.4f} (max {metrics['max_reward']:.4f}) | "
+                            f"LR: {metrics['lr']:.2e}"
                         )
 
                 if self.config.eval_steps and self.global_step % self.config.eval_steps == 0:

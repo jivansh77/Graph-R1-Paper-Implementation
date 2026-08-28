@@ -116,24 +116,30 @@ def compute_answer_reward(solution: str, ground_truth: str | list[str]) -> float
     return compute_f1(predicted, ground_truth)
 
 
-def compute_reward(solution: str, ground_truth: str | list[str]) -> float:
+def compute_reward(solution: str, ground_truth: str | list[str],
+                    format_threshold: float = 0.5) -> float:
     """Compute overall reward R(τ) per Eq. 13.
 
-    R(τ) = -1.0 + R_format(τ) + 𝟙{R_format(τ) = 1} · R_answer(a_T^ans)
-    Answer correctness is only rewarded when format is structurally valid.
+    R(τ) = -1.0 + R_format(τ) + 𝟙{R_format(τ) >= threshold} · R_answer(a_T^ans)
+
+    The paper uses threshold=1.0 (requiring multi-turn format). For
+    compute-constrained settings (LoRA on single GPU), threshold=0.5
+    allows single-turn <think>+<answer> to unlock answer credit, giving
+    the model a gradient signal to learn answer quality earlier.
     """
     r_format = compute_format_reward(solution)
     r_answer = compute_answer_reward(solution, ground_truth)
-    indicator = 1.0 if r_format >= 1.0 else 0.0
+    indicator = 1.0 if r_format >= format_threshold else 0.0
     return -1.0 + r_format + indicator * r_answer
 
 
 def compute_reward_for_batch(
     solutions: list[str],
     ground_truths: list[str | list[str]],
+    format_threshold: float = 0.5,
 ) -> list[float]:
     """Compute rewards for a batch of solutions."""
-    return [compute_reward(sol, gt) for sol, gt in zip(solutions, ground_truths)]
+    return [compute_reward(sol, gt, format_threshold) for sol, gt in zip(solutions, ground_truths)]
 
 
 def compute_em_score(predictions: list[str], ground_truths: list[list[str]]) -> float:
