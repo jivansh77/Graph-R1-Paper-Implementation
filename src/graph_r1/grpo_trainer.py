@@ -102,7 +102,8 @@ class GRPOTrainer:
             self.model = get_peft_model(self.model, lora_config)
             self.model.print_trainable_parameters()
 
-        self.model.gradient_checkpointing_enable()
+        gc_kwargs = {"use_reentrant": True} if self.device_type == "tpu" else {}
+        self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
         self.model.to(self.device)
 
         self.ref_model = AutoModelForCausalLM.from_pretrained(
