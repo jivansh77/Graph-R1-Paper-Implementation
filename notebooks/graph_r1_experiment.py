@@ -413,6 +413,9 @@ print(f"  Rollouts per prompt: {config.num_rollouts}")
 print(f"  Max turns: {config.max_turns}")
 print(f"  Learning rate: {config.learning_rate}")
 
+# SFT warmup: teach the model the think→query→answer format before RL
+trainer.sft_warmup(train_data, num_steps=30)
+
 t0 = time.time()
 training_metrics = trainer.train(train_data, eval_data=test_data)
 training_time = time.time() - t0

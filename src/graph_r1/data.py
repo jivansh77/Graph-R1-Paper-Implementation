@@ -27,8 +27,25 @@ DATASETS = [
     "TriviaQA",
 ]
 
-INSTRUCTION_TEMPLATE = """You are a helpful assistant. Answer the given question. You can query from knowledge base provided to you to answer the question.
-You can query knowledge as many times as you want. You must first conduct reasoning inside <think>...</think>. If you need to query knowledge, you can set a query statement between <query>...</query> to query from knowledge base after <think>...</think>. When you have the final answer, you can output the answer inside <answer>...</answer>. Question: {question}"""
+INSTRUCTION_TEMPLATE = """You are a helpful assistant. Answer the given question by querying the knowledge base.
+
+Instructions:
+1. First reason about what you need in <think>...</think> tags
+2. Search the knowledge base using <query>...</query> tags
+3. After receiving knowledge, reason again and provide your final answer in <answer>...</answer> tags
+
+Example:
+User: What country is the birthplace of the author of "The Old Man and the Sea"?
+Assistant: <think>I need to find the author of "The Old Man and the Sea" first, then find their birthplace country.</think>
+<query>author of The Old Man and the Sea</query>
+[Knowledge received]
+Assistant: <think>The author is Ernest Hemingway. Now I need to find where he was born.</think>
+<query>Ernest Hemingway birthplace country</query>
+[Knowledge received]
+Assistant: <think>Ernest Hemingway was born in Oak Park, Illinois, United States.</think>
+<answer>United States</answer>
+
+Now answer this question: {question}"""
 
 
 def load_flashrag_dataset(data_dir: str, dataset_name: str, split: str = "train") -> list[dict]:

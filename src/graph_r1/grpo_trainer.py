@@ -198,6 +198,11 @@ class GRPOTrainer:
                     "prompt_idx": prompt_idx,
                 })
 
+                if self.global_step < 3 and rollout_idx == 0:
+                    resp_preview = full_response[:200].replace('\n', ' ')
+                    gt_str = gt[0] if isinstance(gt, list) else gt
+                    print(f"    [Rollout] R={reward:.2f} | '{resp_preview}' | GT: '{gt_str[:60]}'")
+
             all_rollouts.extend(prompt_rollouts)
 
         self.model.train()
@@ -342,6 +347,68 @@ class GRPOTrainer:
 
         return metrics
 
+    def sft_warmup(self, train_data: list[dict], num_steps: int = 20):
+        """Supervised fine-tuning warmup to teach the model the expected output format.
+
+        Creates synthetic examples showing the think→query→answer pattern
+        and trains the model to produce them via next-token prediction.
+        """
+        print(f"\n--- SFT Warmup ({num_steps} steps) ---")
+        self.model.train()
+
+        for step in range(num_steps):
+            self.optimizer.zero_grad()
+            item = train_data[step % len(train_data)]
+            if isinstance(item["prompt"], list):
+                prompt_text = item["prompt"][0]["content"]
+            else:
+                prompt_text = item["prompt"]
+            gt = item["reward_model"]["ground_truth"]
+            gt_str = gt[0] if isinstance(gt, list) and gt else str(gt)
+            question = item.get("extra_info", {}).get("question", "the question")
+
+            prompt = f"<|im_start|>user\n{prompt_text}\n<|im_end|>\n<|im_start|>assistant\n"
+            if step % 2 == 0:
+                target_response = (
+                    f"<think>I need to find information to answer: {question}</think>\n"
+                    f"<query>{question}</query>"
+                )
+            else:
+                target_response = (
+                    f"<think>Based on the information I have, the answer is {gt_str}.</think>\n"
+                    f"<answer>{gt_str}</answer>"
+                )
+            full_text = prompt + target_response + self.tokenizer.eos_token
+
+            encoding = self.tokenizer(
+                full_text, return_tensors="pt", truncation=True,
+                max_length=self.config.max_prompt_length + 256,
+            ).to(self.device)
+
+            prompt_enc = self.tokenizer(
+                prompt, return_tensors="pt", truncation=True,
+                max_length=self.config.max_prompt_length,
+            )
+            prompt_len = prompt_enc["input_ids"].shape[1]
+
+            outputs = self.model(**encoding)
+            logits = outputs.logits[:, prompt_len - 1:-1, :]
+            targets = encoding["input_ids"][:, prompt_len:]
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.optimizer.step()
+
+            if step % 5 == 0:
+                print(f"  SFT step {step}: loss={loss.item():.4f}")
+
+            del encoding, outputs, logits, loss
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("SFT warmup complete.\n")
+
     def train(self, train_data: list[dict], eval_data: list[dict] | None = None,
               max_train_hours: float = 7.0) -> list[dict]:
         """Full training loop over the dataset."""
@@ -472,6 +539,10 @@ class GRPOTrainer:
             answer = extract_answer(current_text) or ""
             predictions.append(answer)
             references.append(gt)
+
+            if len(predictions) <= 3:
+                gt_str = gt[0] if isinstance(gt, list) else gt
+                print(f"  [Eval sample {len(predictions)}] Pred: '{answer[:80]}' | Gold: '{gt_str[:80]}'")
 
         em_scores = []
         f1_scores = []
