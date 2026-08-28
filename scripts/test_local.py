@@ -20,14 +20,35 @@ def test_rewards():
     assert extract_answer("<answer>Paris</answer>") == "Paris"
     assert extract_answer("no answer here") == ""
 
-    # Format reward: valid think + answer
+    # Format reward: valid think + answer (single turn)
     sol = "<|im_start|>assistant\n<think>Let me think.</think>\n<answer>Paris</answer><|im_end|>"
     r_fmt = compute_format_reward(sol)
-    assert r_fmt > 0, f"Format reward should be > 0, got {r_fmt}"
+    assert r_fmt == 0.5, f"Single-turn think+answer format should be 0.5, got {r_fmt}"
 
-    # Full reward
-    r = compute_reward(sol, "Paris")
-    assert r > -1.0, f"Reward should be > -1.0 for correct answer, got {r}"
+    # Multi-turn format: think+query then think+answer
+    sol_multi = (
+        "<|im_start|>assistant\n<think>I need info.</think>\n<query>capital of France</query>\n"
+        "<|im_end|>\n<|im_start|>assistant\n<think>Paris is the capital.</think>\n<answer>Paris</answer>"
+    )
+    r_fmt_multi = compute_format_reward(sol_multi)
+    assert r_fmt_multi == 1.0, f"Multi-turn format should be 1.0, got {r_fmt_multi}"
+
+    # Full reward with default threshold=0.5 (single-turn unlocks answer credit)
+    r = compute_reward(sol, "Paris", format_threshold=0.5)
+    assert r > -1.0, f"Reward should be > -1.0 for correct answer at threshold=0.5, got {r}"
+    assert r == -0.5 + compute_f1("Paris", "Paris"), f"Expected -0.5 + F1, got {r}"
+
+    # Full reward with paper threshold=1.0 (single-turn does NOT unlock answer credit)
+    r_strict = compute_reward(sol, "Paris", format_threshold=1.0)
+    assert r_strict == -0.5, f"At threshold=1.0, single-turn should be -0.5, got {r_strict}"
+
+    # Multi-turn with correct answer at threshold=1.0
+    r_multi = compute_reward(sol_multi, "Paris", format_threshold=1.0)
+    assert r_multi > -0.5, f"Multi-turn correct should unlock answer credit, got {r_multi}"
+
+    # Wrong answer should still get format credit
+    r_wrong = compute_reward(sol, "London", format_threshold=0.5)
+    assert r_wrong > -1.0, f"Wrong answer should still get format credit, got {r_wrong}"
 
     print("[PASS] Reward tests")
 

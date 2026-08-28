@@ -99,9 +99,10 @@ The agent has four action types per step:
 ### 3. GRPO Training (Section 4.3)
 
 - **Rollout Generation**: Sample N=5 trajectories per question
-- **Reward**: R(τ) = -1.0 + R_format + 𝟙{format_perfect} · R_answer(F1)
+- **Reward**: R(τ) = -1.0 + R_format + 𝟙{R_format ≥ threshold} · R_answer(F1)
   - Format reward: 0.5 per valid think/query or think/answer block (capped at 1.0)
   - Answer reward: Token-level F1 score vs ground truth
+  - Threshold: 1.0 in paper (multi-turn required), 0.5 for LoRA adaptation
 - **Advantage**: Group-normalized within same-prompt rollouts
 - **Policy Update**: Clipped PPO loss with KL regularization (β=0.001)
 
@@ -202,16 +203,41 @@ Six standard RAG benchmarks from FlashRAG (5,120 train / 128 test each):
 |--------|----------|-------------|-------|----------|-------------|--------|
 | **Graph-R1 (paper)** | **76.45** | **77.46** | **69.42** | **71.27** | **75.01** | **72.99** |
 
+## Reproduction Results
+
+### 2WikiMultiHopQA (Qwen2.5-1.5B-Instruct)
+
+| Metric | Paper | Ours | Gap |
+|--------|-------|------|-----|
+| EM     | 35.13 | TBD  | —   |
+| F1     | 65.73 | TBD  | —   |
+
+*Results pending — v9 run in progress (2026-08-28). See `experiments/experiment_log.md` for full run history.*
+
+### Training Observations
+
+Over 9 iterations, key findings on adapting Graph-R1 for single-GPU LoRA training:
+
+1. **Learning rate matters most**: The paper's LR (5e-7) is tuned for full-parameter training. LoRA updates ~0.5% of parameters and needs ~40x higher LR (2e-5) to produce meaningful parameter updates. With the paper's LR, per-step losses were ~1e-7 — effectively zero learning.
+
+2. **Format reward gating is too strict under compute constraints**: The paper gates answer reward behind `R_format = 1.0`, requiring multi-turn `<think>`+`<query>` followed by `<think>`+`<answer>`. A single-turn response with perfect think+answer structure only earns 0.5 format reward, so the model must discover multi-turn retrieval patterns before getting any answer feedback. We lower the threshold to 0.5, letting single-turn format unlock answer credit while still incentivizing multi-turn through higher format scores.
+
+3. **Per-rollout backward prevents OOM**: Accumulating loss tensors across all rollouts keeps full computational graphs in memory. Processing each rollout's backward pass independently and freeing the graph after each prevents the P100's 16GB from being exhausted.
+
+4. **Gradient checkpointing is essential**: Enables 1.5B model training on 16GB VRAM at the cost of ~30% slower forward passes.
+
 ## Differences from Original
 
 | Aspect | Original | Our Reproduction |
 |--------|----------|-----------------|
 | Compute | 4× A100 80GB | Kaggle T4/P100 16GB |
 | Training | Full parameters via VERL/Ray | LoRA (r=16) via PyTorch |
-| Batch size | 128 | 4-16 (grad accum) |
+| Batch size | 128 | 4 (with gradient accumulation) |
 | Rollouts | 5 per prompt | 3 per prompt |
+| Learning rate | 5e-7 (full-param) | 2e-5 (LoRA) + cosine decay |
+| Format threshold | 1.0 (multi-turn required) | 0.5 (single-turn unlocks F1) |
 | N-ary extraction | GPT-4o-mini API | Local regex-based |
-| Framework | VERL + Ray distributed | Custom single-GPU |
+| Framework | VERL + Ray distributed | Custom single-GPU PyTorch |
 
 These differences primarily affect training scale and graph construction quality, but the core algorithm (GRPO with format+answer rewards over hypergraph retrieval) is faithfully implemented.
 
