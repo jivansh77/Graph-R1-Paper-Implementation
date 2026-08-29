@@ -106,14 +106,16 @@ class GRPOTrainer:
             self.model.gradient_checkpointing_enable()
         self.model.to(self.device)
 
+        ref_device = torch.device("cpu") if self.device_type == "tpu" else self.device
         self.ref_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=dtype,
             trust_remote_code=True,
-        ).to(self.device)
+        ).to(ref_device)
         self.ref_model.eval()
         for p in self.ref_model.parameters():
             p.requires_grad = False
+        self.ref_device = ref_device
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -290,36 +292,35 @@ class GRPOTrainer:
             advantage = rollout["advantage"]
 
             full_text = prompt_text + response_text
-            encoding = self.tokenizer(
-                full_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_seq,
-            ).to(self.device)
-
+            tok_kwargs = dict(return_tensors="pt", truncation=True, max_length=max_seq)
             prompt_encoding = self.tokenizer(
-                prompt_text,
-                return_tensors="pt",
-                truncation=True,
+                prompt_text, return_tensors="pt", truncation=True,
                 max_length=self.config.max_prompt_length,
             )
             prompt_len = prompt_encoding["input_ids"].shape[1]
+
+            encoding = self.tokenizer(full_text, **tok_kwargs)
             response_len = encoding["input_ids"].shape[1] - prompt_len
 
             if response_len <= 0:
                 continue
 
             with torch.no_grad():
-                ref_outputs = self.ref_model(**encoding)
+                ref_enc = {k: v.to(self.ref_device) for k, v in encoding.items()}
+                ref_outputs = self.ref_model(**ref_enc)
                 ref_logits = ref_outputs.logits[:, prompt_len - 1:-1, :]
                 ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-                response_tokens = encoding["input_ids"][:, prompt_len:]
-                ref_token_log_probs = ref_log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
-                del ref_outputs, ref_logits, ref_log_probs
+                ref_response_tokens = ref_enc["input_ids"][:, prompt_len:]
+                ref_token_log_probs = ref_log_probs.gather(
+                    2, ref_response_tokens.unsqueeze(-1)
+                ).squeeze(-1).to(self.device)
+                del ref_outputs, ref_logits, ref_log_probs, ref_enc
 
+            encoding = {k: v.to(self.device) for k, v in encoding.items()}
             outputs = self.model(**encoding)
             logits = outputs.logits[:, prompt_len - 1:-1, :]
             log_probs = F.log_softmax(logits, dim=-1)
+            response_tokens = encoding["input_ids"][:, prompt_len:]
             token_log_probs = log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
             del outputs, logits, log_probs
 

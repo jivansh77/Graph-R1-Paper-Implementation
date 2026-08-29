@@ -124,12 +124,21 @@
 - **Root cause**: XLA autoregressive generation is extremely slow (~24 min per generation vs ~10-20s on CPU). XLA needs to trace/compile each unique graph shape, and autoregressive generation has changing tensor shapes at each token. Eventually killed by OOM after accumulating too much memory during the slow generation.
 - **Fix for v14**: Move model to CPU for generation (rollouts + eval), keep only training forward/backward on TPU
 
-### Run 14: 2WikiMultiHopQA - v14 (PENDING)
+### Run 14: 2WikiMultiHopQA - v14 (FAILED - TPU HBM OOM)
 - **Date**: 2026-08-28
+- **Runtime**: ~41 min (2469s)
+- **Hardware**: Kaggle TPU v3-8 (15.75GB HBM per core)
+- **Key change**: CPU generation working perfectly (rollouts in ~30-80s vs ~24 min on XLA)
+- **SFT warmup**: Completed (30 steps, 31 min)
+- **Progress**: Generated first GRPO rollouts successfully on CPU. Model using `<query>` tags and receiving knowledge.
+- **Error**: `ValueError: XLA:TPU compile permanent error. Ran out of memory in memory space hbm. Used 17.14G of 15.75G hbm.`
+- **Root cause**: Model (~3GB) + ref_model (~3GB) + activations/gradients = 17.14GB exceeds 15.75GB per TPU core
+- **Fix for v15**: Keep ref_model on CPU (only needs no-grad forward pass), freeing ~3GB TPU HBM
+
+### Run 15: 2WikiMultiHopQA - v15 (PENDING)
+- **Date**: 2026-08-29
 - **Hardware**: Kaggle TPU v3-8
-- **Key change**: Hybrid CPU/TPU approach - generation on CPU, training on TPU
-  - `_move_for_generation()`: moves model to CPU before rollout/eval generation
-  - `_move_for_training()`: moves model back to TPU for forward/backward pass
-  - Expected: ~10-20s per generation on CPU vs ~24 min on TPU/XLA
-  - Model move overhead: ~5-10s each way (1.5B model in bfloat16 ~3GB)
-- **Expected runtime**: ~3-4 hours (SFT 30 min + 256 GRPO steps at ~45s each + eval)
+- **Key changes**:
+  - ref_model stays on CPU (saves ~3GB TPU HBM)
+  - compute_policy_loss: ref logprobs computed on CPU, transferred to TPU for loss
+  - Expected TPU HBM: ~3GB model + ~10GB activations/gradients = ~13GB (fits in 15.75GB)
