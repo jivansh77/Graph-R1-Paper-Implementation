@@ -135,10 +135,18 @@
 - **Root cause**: Model (~3GB) + ref_model (~3GB) + activations/gradients = 17.14GB exceeds 15.75GB per TPU core
 - **Fix for v15**: Keep ref_model on CPU (only needs no-grad forward pass), freeing ~3GB TPU HBM
 
-### Run 15: 2WikiMultiHopQA - v15 (PENDING)
+### Run 15: 2WikiMultiHopQA - v15 (FAILED - TPU HBM OOM)
+- **Date**: 2026-08-29
+- **Runtime**: ~40 min (2406s)
+- **Error**: `Used 16.58G of 15.75G hbm. Exceeded by 854.89M.`
+- **Progress**: SFT warmup completed. Model using `<query>` tags, getting R=0.00 (up from -0.50).
+- **Root cause**: XLA lazy execution accumulates computation graphs across all rollouts in compute_policy_loss without mark_step(). 6 rollouts × activations = massive peak memory.
+- **Fix for v16**: Add `_sync_device()` after each rollout's backward pass to force XLA graph execution and memory release. Also cap max_seq to 2048 tokens.
+
+### Run 16: 2WikiMultiHopQA - v16 (PENDING)
 - **Date**: 2026-08-29
 - **Hardware**: Kaggle TPU v3-8
 - **Key changes**:
-  - ref_model stays on CPU (saves ~3GB TPU HBM)
-  - compute_policy_loss: ref logprobs computed on CPU, transferred to TPU for loss
-  - Expected TPU HBM: ~3GB model + ~10GB activations/gradients = ~13GB (fits in 15.75GB)
+  - `_sync_device()` (xm.mark_step()) after each rollout backward in compute_policy_loss
+  - Max sequence length capped at 2048 for policy loss computation
+  - Expected: each rollout's graph is executed and freed before the next, reducing peak HBM to ~1 rollout's worth

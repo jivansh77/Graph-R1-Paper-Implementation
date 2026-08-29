@@ -284,7 +284,7 @@ class GRPOTrainer:
         """
         total_loss_scalar = 0.0
         num_valid = 0
-        max_seq = self.config.max_prompt_length + self.config.max_response_length
+        max_seq = min(2048, self.config.max_prompt_length + self.config.max_response_length)
 
         for rollout in rollouts:
             prompt_text = rollout["prompt"]
@@ -342,6 +342,7 @@ class GRPOTrainer:
             num_valid += 1
 
             del encoding, token_log_probs, ref_token_log_probs, ratio, loss, scaled_loss
+            self._sync_device()
 
         if num_valid > 0:
             total_loss_scalar /= num_valid
