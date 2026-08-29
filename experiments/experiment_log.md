@@ -143,10 +143,28 @@
 - **Root cause**: XLA lazy execution accumulates computation graphs across all rollouts in compute_policy_loss without mark_step(). 6 rollouts × activations = massive peak memory.
 - **Fix for v16**: Add `_sync_device()` after each rollout's backward pass to force XLA graph execution and memory release. Also cap max_seq to 2048 tokens.
 
-### Run 16: 2WikiMultiHopQA - v16 (PENDING)
+### Run 16: 2WikiMultiHopQA - v16 (FAILED - Killed after ~4.9h)
 - **Date**: 2026-08-29
+- **Runtime**: ~4.9 hours (17,723s)
 - **Hardware**: Kaggle TPU v3-8
 - **Key changes**:
   - `_sync_device()` (xm.mark_step()) after each rollout backward in compute_policy_loss
   - Max sequence length capped at 2048 for policy loss computation
-  - Expected: each rollout's graph is executed and freed before the next, reducing peak HBM to ~1 rollout's worth
+- **Progress**: No more OOM! Completed SFT warmup + 20 GRPO steps
+  - SFT warmup: 30 steps in ~24 min, losses 0.62→0.26
+  - Model using `<query>` tags and receiving knowledge
+  - Rewards improving: -0.50 → -0.33 (step 10) → -0.25 (step 20)
+  - Some rollouts achieving R=0.00 (format correct, getting knowledge)
+- **Error**: `Killed` (process killed by system after 17,723s)
+- **Root cause**: CPU generation too slow (~8-9 min per GRPO step). 256 steps would need ~35 hours, far exceeding the 9h TPU limit. Each step requires moving model CPU→generate→CPU→TPU for training.
+- **Positive**: XLA mark_step fix worked — no more TPU HBM OOM. Training dynamics are healthy.
+
+### Run 17: 2WikiMultiHopQA - v17 (PENDING)
+- **Date**: 2026-08-29
+- **Hardware**: Kaggle GPU (T4 16GB) — GPU quota reset
+- **Key changes**: Switched back to GPU. All TPU/XLA improvements retained but GPU path is much faster:
+  - GPU generation is native CUDA (no CPU transfer needed)
+  - ref_model stays on GPU (enough VRAM)
+  - Gradient checkpointing enabled
+  - SFT warmup (30 steps) before GRPO
+  - Expected ~1-2 min/step vs ~8-9 min on TPU hybrid
