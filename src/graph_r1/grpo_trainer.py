@@ -57,6 +57,15 @@ class GRPOConfig:
     lora_alpha: int = 32
 
 
+class _SafeLogitsProcessor:
+    """Clamp inf/nan logits to prevent float16 overflow during sampling."""
+
+    def __call__(self, input_ids, scores):
+        scores = torch.clamp(scores, min=-1e4, max=1e4)
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
+        return scores
+
+
 class GRPOTrainer:
     """Implements GRPO training for Graph-R1.
 
@@ -213,6 +222,7 @@ class GRPOTrainer:
                             temperature=0.7,
                             top_p=0.9,
                             pad_token_id=self.tokenizer.pad_token_id,
+                            logits_processor=[_SafeLogitsProcessor()],
                         )
 
                     response = self.tokenizer.decode(
@@ -558,6 +568,7 @@ class GRPOTrainer:
                     max_new_tokens=512,
                     do_sample=False,
                     pad_token_id=self.tokenizer.pad_token_id,
+                    logits_processor=[_SafeLogitsProcessor()],
                 )
                 response = self.tokenizer.decode(
                     outputs[0][inputs["input_ids"].shape[1]:],
