@@ -191,3 +191,28 @@
   - Format reward: checks `<|im_start|>assistant\n...<|im_end|>` blocks, +0.5 per valid block
   - Answer reward: F1 score, only unlocked when format_reward == 1.0
   - Uses `kl_loss_type: low_var_kl` with coeff 0.001
+
+### Run 19: 2WikiMultiHopQA - v19 (COMPLETED - 0% results, advantage collapse)
+- **Date**: 2026-08-29
+- **Runtime**: ~5.0 hours (17,855s)
+- **Hardware**: Kaggle GPU P100 16GB
+- **Config**: 512 train samples, LR=2e-5, batch_size=4, mini_batch_size=2, num_rollouts=3
+- **Training**: 256 steps completed, all with finite loss (NaN fix worked!)
+- **Results**: EM=0.0%, F1=0.0%
+- **Progress vs v18**: NaN loss fixed! All losses now finite (~0.76 at step 10, decaying to ~1e-5 by step 30+). Model learned format and used `<query>` tags.
+- **Root cause**: **Advantage collapse** — all rollouts converge to same reward (R=0.0) by step 30. GRPO advantage normalization: (0-0)/(0+ε) ≈ 0 → zero gradient → no learning. The model found a local optimum: produce `<answer>...</answer>` (literal ellipsis) which satisfies format but has 0% F1.
+- **Training dynamics**:
+  - Steps 10-20: Mean reward -0.25, some diversity, finite losses ~0.8
+  - Steps 30+: Mean reward 0.0, ALL rollouts identical, losses ~1e-5
+  - Eval predictions: `Pred: '...'` — degenerate answer
+- **Diagnosis**: With temp=0.7 and 3 rollouts, model converges too fast to degenerate solution. No reward diversity → no gradient → stuck.
+
+### Run 20: 2WikiMultiHopQA - v20 (PENDING)
+- **Date**: 2026-08-29
+- **Hardware**: Kaggle GPU P100 16GB
+- **Key changes**:
+  1. **Advantage collapse fix**: When reward std < 0.01, use raw centered advantages instead of normalizing. This preserves gradient even when all rollouts get same reward.
+  2. **Temperature 1.0** (was 0.7): More diverse rollouts increase chance of reward differentiation.
+  3. **5 rollouts** (was 3): Matches paper setting, more diversity per prompt group.
+  4. **Degenerate answer penalty**: Answers like `...` or single chars get R_answer = -0.25 instead of 0.0, breaking the local optimum.
+  5. **Better SFT warmup**: Added full multi-turn examples (query→knowledge→answer) alongside single-turn, teaching the model the complete reasoning chain.

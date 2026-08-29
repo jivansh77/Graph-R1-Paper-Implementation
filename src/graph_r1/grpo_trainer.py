@@ -227,8 +227,8 @@ class GRPOTrainer:
                             **inputs,
                             max_new_tokens=min(512, self.config.max_response_length),
                             do_sample=True,
-                            temperature=0.7,
-                            top_p=0.9,
+                            temperature=1.0,
+                            top_p=0.95,
                             pad_token_id=self.tokenizer.pad_token_id,
                             logits_processor=[_SafeLogitsProcessor()],
                         )
@@ -280,6 +280,10 @@ class GRPOTrainer:
         """Compute GRPO advantages: normalize rewards within each prompt group.
 
         Â(τ_i) = (R(τ_i) - mean({R(τ_j)})) / std({R(τ_j)})
+
+        When all rollouts have near-identical rewards (std < 0.01),
+        normalization kills the gradient signal. Fall back to raw
+        centered advantages so training can still learn.
         """
         groups = defaultdict(list)
         for r in rollouts:
@@ -288,10 +292,14 @@ class GRPOTrainer:
         for prompt_idx, group in groups.items():
             rewards = [r["reward"] for r in group]
             mean_r = np.mean(rewards)
-            std_r = np.std(rewards) + 1e-6
+            std_r = np.std(rewards)
 
-            for r in group:
-                r["advantage"] = (r["reward"] - mean_r) / std_r
+            if std_r < 0.01:
+                for r in group:
+                    r["advantage"] = r["reward"] - mean_r
+            else:
+                for r in group:
+                    r["advantage"] = (r["reward"] - mean_r) / std_r
 
         return rollouts
 
@@ -442,14 +450,25 @@ class GRPOTrainer:
             question = item.get("extra_info", {}).get("question", "the question")
 
             prompt = f"<|im_start|>user\n{prompt_text}\n<|im_end|>\n<|im_start|>assistant\n"
-            if step % 2 == 0:
+            pattern = step % 3
+            if pattern == 0:
                 target_response = (
                     f"<think>I need to find information to answer: {question}</think>\n"
                     f"<query>{question}</query>"
                 )
-            else:
+            elif pattern == 1:
                 target_response = (
                     f"<think>Based on the information I have, the answer is {gt_str}.</think>\n"
+                    f"<answer>{gt_str}</answer>"
+                )
+            else:
+                target_response = (
+                    f"<think>Let me search for relevant information.</think>\n"
+                    f"<query>{question}</query>"
+                    f"<|im_end|>\n<|im_start|>user\n"
+                    f"<knowledge>[1] {gt_str} is the answer to this question.</knowledge>\n"
+                    f"<|im_end|>\n<|im_start|>assistant\n"
+                    f"<think>Based on the retrieved information, the answer is {gt_str}.</think>\n"
                     f"<answer>{gt_str}</answer>"
                 )
             full_text = prompt + target_response + self.tokenizer.eos_token

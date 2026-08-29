@@ -142,7 +142,7 @@ EXPERIMENT_CONFIG = {
     "test_samples": 128,
     "batch_size": 4,
     "mini_batch_size": 2,
-    "num_rollouts": 3,
+    "num_rollouts": 5,
     "max_turns": 3,
     "num_epochs": 1,
     "learning_rate": 2e-5,

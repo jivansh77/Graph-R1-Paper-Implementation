@@ -106,10 +106,15 @@ def compute_answer_reward(solution: str, ground_truth: str | list[str]) -> float
     """Compute answer reward R_answer using F1 score.
 
     If ground_truth is a list, takes the max F1 across all references.
+    Penalizes degenerate answers (ellipsis, single punctuation, etc.).
     """
     predicted = extract_answer(solution)
     if not predicted:
         return 0.0
+
+    normalized = predicted.strip().strip(".")
+    if not normalized or len(normalized) <= 1:
+        return -0.25
 
     if isinstance(ground_truth, list):
         return max(compute_f1(predicted, gt) for gt in ground_truth) if ground_truth else 0.0
