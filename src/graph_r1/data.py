@@ -30,9 +30,9 @@ DATASETS = [
 INSTRUCTION_TEMPLATE = """You are a helpful assistant. Answer the given question by querying the knowledge base.
 
 Instructions:
-1. First reason about what you need in <think>...</think> tags
-2. Search the knowledge base using <query>...</query> tags
-3. After receiving knowledge, reason again and provide your final answer in <answer>...</answer> tags
+1. First reason about what you need in think tags
+2. Search the knowledge base using query tags
+3. After receiving knowledge, reason again and provide your final answer in answer tags
 
 Example:
 User: What country is the birthplace of the author of "The Old Man and the Sea"?

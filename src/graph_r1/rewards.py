@@ -51,9 +51,15 @@ def compute_em(prediction: str, ground_truth: str) -> float:
 
 
 def extract_answer(text: str) -> str:
-    """Extract content from <answer>...</answer> tags."""
-    match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    return match.group(1).strip() if match else ""
+    """Extract content from <answer>...</answer> tags.
+
+    Uses the LAST match to skip any <answer>...</answer> placeholders
+    in the instruction template.
+    """
+    matches = re.findall(r"<answer>(.*?)</answer>", text, re.DOTALL)
+    if not matches:
+        return ""
+    return matches[-1].strip()
 
 
 def extract_blocks(solution: str) -> list[str]:

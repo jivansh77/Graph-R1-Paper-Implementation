@@ -211,8 +211,9 @@
 - **Date**: 2026-08-29
 - **Hardware**: Kaggle GPU P100 16GB
 - **Key changes**:
-  1. **Advantage collapse fix**: When reward std < 0.01, use raw centered advantages instead of normalizing. This preserves gradient even when all rollouts get same reward.
-  2. **Temperature 1.0** (was 0.7): More diverse rollouts increase chance of reward differentiation.
-  3. **5 rollouts** (was 3): Matches paper setting, more diversity per prompt group.
-  4. **Degenerate answer penalty**: Answers like `...` or single chars get R_answer = -0.25 instead of 0.0, breaking the local optimum.
-  5. **Better SFT warmup**: Added full multi-turn examples (query→knowledge→answer) alongside single-turn, teaching the model the complete reasoning chain.
+  1. **CRITICAL BUG FIX — answer extraction**: `extract_answer()` used `re.search` (first match) on the full text including the prompt. The instruction template contained `<answer>...</answer>` as a placeholder in line "provide your final answer in <answer>...</answer> tags". This matched FIRST, so `extract_answer` always returned literal `...` instead of the model's actual answer. This bug caused 0% F1 in ALL previous runs (v8-v19). Fixed by using `re.findall` + taking the LAST match. Also removed literal `<answer>` tags from instruction template.
+  2. **Advantage collapse fix**: When reward std < 0.01, use raw centered advantages instead of normalizing.
+  3. **Temperature 1.0** (was 0.7): More diverse rollouts.
+  4. **5 rollouts** (was 3): Matches paper setting.
+  5. **Degenerate answer penalty**: Answers like `...` or single chars get R_answer = -0.25.
+  6. **Better SFT warmup**: Added full multi-turn examples (query→knowledge→answer).
