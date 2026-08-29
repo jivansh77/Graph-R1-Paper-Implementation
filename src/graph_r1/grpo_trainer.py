@@ -133,6 +133,14 @@ class GRPOTrainer:
         )
         self.scheduler = None
 
+        self.use_fp16_scaler = (self.device_type == "cuda" and dtype == torch.float16)
+        if self.use_fp16_scaler:
+            from torch.cuda.amp import GradScaler
+            self.grad_scaler = GradScaler()
+            print("Using GradScaler for float16 training (P100 compatibility)")
+        else:
+            self.grad_scaler = None
+
         self.global_step = 0
         self.training_log = []
 
@@ -318,7 +326,7 @@ class GRPOTrainer:
             with torch.no_grad():
                 ref_enc = {k: v.to(self.ref_device) for k, v in encoding.items()}
                 ref_outputs = self.ref_model(**ref_enc)
-                ref_logits = ref_outputs.logits[:, prompt_len - 1:-1, :]
+                ref_logits = ref_outputs.logits[:, prompt_len - 1:-1, :].float()
                 ref_log_probs = F.log_softmax(ref_logits, dim=-1)
                 ref_response_tokens = ref_enc["input_ids"][:, prompt_len:]
                 ref_token_log_probs = ref_log_probs.gather(
@@ -328,13 +336,14 @@ class GRPOTrainer:
 
             encoding = {k: v.to(self.device) for k, v in encoding.items()}
             outputs = self.model(**encoding)
-            logits = outputs.logits[:, prompt_len - 1:-1, :]
+            logits = outputs.logits[:, prompt_len - 1:-1, :].float()
             log_probs = F.log_softmax(logits, dim=-1)
             response_tokens = encoding["input_ids"][:, prompt_len:]
             token_log_probs = log_probs.gather(2, response_tokens.unsqueeze(-1)).squeeze(-1)
             del outputs, logits, log_probs
 
             ratio = torch.exp(token_log_probs - ref_token_log_probs.detach())
+            ratio = torch.clamp(ratio, max=10.0)
 
             advantage_tensor = torch.tensor(advantage, device=self.device, dtype=torch.float32)
             pg_loss1 = -advantage_tensor * ratio
@@ -347,7 +356,10 @@ class GRPOTrainer:
             loss = pg_loss + self.config.kl_coeff * kl_div
 
             scaled_loss = loss / len(rollouts)
-            scaled_loss.backward()
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             total_loss_scalar += loss.item()
             num_valid += 1
 
@@ -376,8 +388,14 @@ class GRPOTrainer:
 
         loss_value = self.compute_policy_loss(rollouts)
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
+        if self.grad_scaler is not None:
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
 
@@ -448,13 +466,20 @@ class GRPOTrainer:
             prompt_len = prompt_enc["input_ids"].shape[1]
 
             outputs = self.model(**encoding)
-            logits = outputs.logits[:, prompt_len - 1:-1, :]
+            logits = outputs.logits[:, prompt_len - 1:-1, :].float()
             targets = encoding["input_ids"][:, prompt_len:]
             loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(loss).backward()
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
             self._sync_device()
 
             if step % 5 == 0:

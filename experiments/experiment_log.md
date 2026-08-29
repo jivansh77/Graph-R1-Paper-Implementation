@@ -159,12 +159,35 @@
 - **Root cause**: CPU generation too slow (~8-9 min per GRPO step). 256 steps would need ~35 hours, far exceeding the 9h TPU limit. Each step requires moving model CPU→generate→CPU→TPU for training.
 - **Positive**: XLA mark_step fix worked — no more TPU HBM OOM. Training dynamics are healthy.
 
-### Run 17: 2WikiMultiHopQA - v17 (PENDING)
+### Run 17: 2WikiMultiHopQA - v17 (FAILED - NaN crash)
 - **Date**: 2026-08-29
-- **Hardware**: Kaggle GPU (T4 16GB) — GPU quota reset
-- **Key changes**: Switched back to GPU. All TPU/XLA improvements retained but GPU path is much faster:
-  - GPU generation is native CUDA (no CPU transfer needed)
-  - ref_model stays on GPU (enough VRAM)
-  - Gradient checkpointing enabled
-  - SFT warmup (30 steps) before GRPO
-  - Expected ~1-2 min/step vs ~8-9 min on TPU hybrid
+- **Hardware**: Kaggle GPU P100 16GB
+- **Runtime**: ~480s
+- **Error**: `RuntimeError: probability tensor contains either inf, nan or element < 0` during generation
+- **Root cause**: P100 uses float16 (max value 65504). After SFT warmup, model logits overflow float16 during sampling.
+- **Fix**: Added `_SafeLogitsProcessor` to clamp logits to [-1e4, 1e4] during generation
+
+### Run 18: 2WikiMultiHopQA - v18 (COMPLETED - 0% results)
+- **Date**: 2026-08-29
+- **Runtime**: ~7.1 hours (25,404s)
+- **Hardware**: Kaggle GPU P100 16GB
+- **Config**: 512 train samples, LR=2e-5, batch_size=4, mini_batch_size=2, num_rollouts=3
+- **Training**: 116 GRPO steps completed, all with Loss=NaN, Reward=-1.0
+- **Results**: EM=0.0%, F1=0.0%
+- **Root cause analysis**: SafeLogitsProcessor fixed generation sampling crash, but `compute_policy_loss` operations (log_softmax, exp(ratio)) still computed in native float16, producing NaN. NaN gradients corrupted all model weights by step 10, causing all subsequent rollouts to produce nonsense.
+- **SFT warmup worked correctly**: Step 0 rollouts showed model using `<query>` tags and achieving R=0.00 (format-correct). But first GRPO backward pass produced NaN, destroying the learned weights.
+
+### Run 19: 2WikiMultiHopQA - v19 (PENDING)
+- **Date**: 2026-08-29
+- **Hardware**: Kaggle GPU P100 16GB
+- **Key changes** (informed by analysis of official LHRLAB/Graph-R1 repository):
+  1. **Cast all loss computation to float32**: `logits.float()` before log_softmax/exp in both compute_policy_loss and SFT warmup. Official code runs on A100 with bfloat16/FSDP which handles precision automatically; P100 needs explicit float32 upcasting.
+  2. **GradScaler for float16**: Proper mixed-precision training with torch.cuda.amp.GradScaler for backward/optimizer steps.
+  3. **Ratio clamping**: `torch.clamp(ratio, max=10.0)` to prevent extreme policy ratios.
+- **Official repo findings** (LHRLAB/Graph-R1):
+  - Uses VERL framework with FSDP (handles mixed precision automatically)
+  - 4x A100 80GB with bfloat16 (wide dynamic range, no overflow)
+  - LR 5e-7 for full-parameter, batch_size=128, 5 rollouts
+  - Format reward: checks `<|im_start|>assistant\n...<|im_end|>` blocks, +0.5 per valid block
+  - Answer reward: F1 score, only unlocked when format_reward == 1.0
+  - Uses `kl_loss_type: low_var_kl` with coeff 0.001
