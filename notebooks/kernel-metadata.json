@@ -1,0 +1,15 @@
+{
+    "id": "jivanshc/graph-r1-reproduction-2wikimultihopqa",
+    "title": "Graph-R1 Reproduction - 2WikiMultiHopQA",
+    "code_file": "graph_r1_experiment.py",
+    "language": "python",
+    "kernel_type": "script",
+    "is_private": true,
+    "enable_gpu": true,
+    "enable_tpu": false,
+    "enable_internet": true,
+    "keywords": ["graph-r1", "graphrag", "reinforcement-learning", "grpo", "qwen2.5"],
+    "dataset_sources": [],
+    "competition_sources": [],
+    "kernel_sources": []
+}

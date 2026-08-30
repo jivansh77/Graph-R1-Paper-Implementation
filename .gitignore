@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data and model files
+data/
+*.bin
+*.npy
+*.faiss
+checkpoints/
+*.pt
+*.safetensors
+
+# Experiment outputs (keep logs)
+experiments/*/index_*.bin
+experiments/*/*.npy
+experiments/*/kv_store_*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kaggle
+.kaggle/
+
+# Environment
+.env
+*.env

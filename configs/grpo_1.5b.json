@@ -1,0 +1,22 @@
+{
+    "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "learning_rate": 5e-7,
+    "batch_size": 16,
+    "mini_batch_size": 2,
+    "num_rollouts": 5,
+    "max_prompt_length": 4096,
+    "max_response_length": 4096,
+    "max_turns": 5,
+    "top_k_retrieval": 5,
+    "clip_range": 0.2,
+    "kl_coeff": 0.001,
+    "num_epochs": 1,
+    "gradient_accumulation_steps": 8,
+    "save_steps": 50,
+    "eval_steps": 10,
+    "max_grad_norm": 1.0,
+    "output_dir": "checkpoints/qwen2.5-1.5b-grpo",
+    "use_lora": true,
+    "lora_r": 16,
+    "lora_alpha": 32
+}
