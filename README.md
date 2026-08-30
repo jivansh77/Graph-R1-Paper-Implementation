@@ -63,7 +63,7 @@ Graph-R1-Paper-Implementation/
 │   └── data.py                # FlashRAG dataset loading
 ├── configs/                   # Training configurations
 │   ├── grpo_1.5b.json         # Qwen2.5-1.5B config
-│   └── grpo_3b.json           # Qwen2.5-3B config
+│   └── grpo_3b.json          # Qwen2.5-3B config
 ├── scripts/                   # Utility scripts
 │   ├── prepare_data.py        # Download & format datasets
 │   ├── build_hypergraph.py    # Build knowledge hypergraph
@@ -207,53 +207,89 @@ Six standard RAG benchmarks from FlashRAG (5,120 train / 128 test each):
 
 ### 2WikiMultiHopQA (Qwen2.5-1.5B-Instruct)
 
-| Metric | Paper | Ours (v9) | Gap |
-|--------|-------|-----------|-----|
-| EM     | 35.13 | 0.0       | -35.13 |
-| F1     | 65.73 | 0.0       | -65.73 |
+| Metric | Paper | Ours (v20) | Gap |
+|--------|-------|------------|-----|
+| EM     | 35.13 | 10.94      | -24.19 |
+| F1     | 65.73 | 21.09      | -44.64 |
 
-*Current results reflect significant compute gap (single P100 16GB + LoRA vs 4x A100 80GB + full params). v10 with SFT warmup + few-shot prompting pending GPU quota reset. See `experiments/experiment_log.md` for the full 9-run iteration log.*
+**Training config**: 512 train samples, batch_size=4, mini_batch_size=2, num_rollouts=3, LR=2e-5, LoRA r=16, temperature=1.0, 1 epoch on Kaggle P100 16GB (~6.1 hours).
 
-### Training Observations
+**Hypergraph**: 15,792 entities, 9,747 hyperedges, avg 4.4 entities per hyperedge.
 
-Over 9 iterations, key findings on adapting Graph-R1 for single-GPU LoRA training:
+The gap vs paper results is expected given the significant compute and methodology differences (see [Differences from Original](#differences-from-original)). This reproduction validates that the core algorithm works — the model learns to use `<query>` tags for retrieval and produces meaningful answers — while identifying the specific challenges of adapting distributed full-parameter GRPO training to single-GPU LoRA fine-tuning.
 
-1. **Learning rate matters most**: The paper's LR (5e-7) is tuned for full-parameter training. LoRA updates ~0.5% of parameters and needs ~40x higher LR (2e-5) to produce meaningful parameter updates. With the paper's LR, per-step losses were ~1e-7 — effectively zero learning.
+### Training Dynamics (v20)
 
-2. **Format reward gating is too strict under compute constraints**: The paper gates answer reward behind `R_format = 1.0`, requiring multi-turn `<think>`+`<query>` followed by `<think>`+`<answer>`. A single-turn response with perfect think+answer structure only earns 0.5 format reward, so the model must discover multi-turn retrieval patterns before getting any answer feedback. We lower the threshold to 0.5, letting single-turn format unlock answer credit while still incentivizing multi-turn through higher format scores.
+- Rewards showed healthy diversity: max reward reached 1.0, mean reward improved over training
+- Eval F1 improved over time (13.1% at step 64 → 29.0% at step 192)
+- Model successfully learned the think → query → retrieve → answer loop
+- SFT warmup (30 steps) was essential for bootstrapping the multi-turn format
 
-3. **Per-rollout backward prevents OOM**: Accumulating loss tensors across all rollouts keeps full computational graphs in memory. Processing each rollout's backward pass independently and freeing the graph after each prevents the P100's 16GB from being exhausted.
+## The 20-Run Journey
 
-4. **Gradient checkpointing is essential**: Enables 1.5B model training on 16GB VRAM at the cost of ~30% slower forward passes.
+Getting from 0% to 10.9% EM / 21.1% F1 required 20 Kaggle kernel iterations, uncovering and fixing layered bugs that only became visible once earlier ones were resolved:
+
+### Critical Bugs Discovered
+
+1. **Answer extraction bug (runs 8-19)**: The instruction template contained `<answer>...</answer>` as placeholder text. `extract_answer()` used `re.search` (first match) on the full prompt+response, always matching the instruction placeholder instead of the model's actual answer — returning literal `"..."`. This caused **0% F1 in every single run** because `F1("...", gold_answer) = 0` always. During training, the model never received credit for correct answers. Fixed by switching to `re.findall` + taking the last match.
+
+2. **Float16 NaN loss (run 18)**: The P100 GPU uses float16 (max value 65504), while the paper's A100s use bfloat16. Operations like `log_softmax` and `exp(ratio)` in `compute_policy_loss` overflowed float16, producing NaN gradients that corrupted all model weights within 10 steps. Fixed by casting logits to float32, adding `GradScaler`, and clamping policy ratios.
+
+3. **Advantage collapse (run 19)**: With temperature=0.7 and 3 rollouts, all rollouts quickly converged to the same reward. GRPO's group normalization then produced `(0-0)/(0+ε) ≈ 0` — zero gradients, zero learning. The model found a degenerate local optimum: `<answer>...</answer>` (literal ellipsis). Fixed by skipping normalization when std < 0.01, increasing temperature to 1.0, and penalizing degenerate answers.
+
+4. **P100 CUDA incompatibility (run 1)**: PyTorch 2.10.0+cu128 requires CUDA capability ≥ 7.0; the P100 has 6.0. Required downgrading to torch 2.4.0+cu121.
+
+5. **GPU OOM (run 6)**: Accumulating all rollout loss tensors kept full computational graphs in memory. Fixed by per-rollout backward passes with graph freeing after each.
+
+### Run History Summary
+
+| Run | Hardware | Result | Issue |
+|-----|----------|--------|-------|
+| 1-5 | GPU | Failed | CUDA compat, imports, torchvision, transformers, torchao |
+| 6 | GPU | OOM at step 85 | Accumulated computational graphs |
+| 8 | GPU | EM=0%, F1=0% | LR too low (5e-7), format reward too strict |
+| 9 | GPU | EM=0%, F1=0% | Model learned format but never used `<query>` tags |
+| 10-12 | TPU | Failed | torch_xla gradient checkpointing incompatible |
+| 13 | TPU | Killed after 5.7h | XLA autoregressive generation too slow |
+| 14-15 | TPU | OOM | Model + ref_model exceeds 15.75GB TPU HBM |
+| 16 | TPU | Killed after 4.9h | CPU generation too slow (35h projected) |
+| 17 | GPU | NaN crash | Float16 overflow in generation logits |
+| 18 | GPU | EM=0%, F1=0% | NaN in policy loss (float16 overflow) |
+| 19 | GPU | EM=0%, F1=0% | Advantage collapse + answer extraction bug |
+| **20** | **GPU** | **EM=10.9%, F1=21.1%** | **All fixes applied** |
 
 ## Differences from Original
 
 | Aspect | Original | Our Reproduction |
 |--------|----------|-----------------|
-| Compute | 4× A100 80GB | Kaggle T4/P100 16GB |
-| Training | Full parameters via VERL/Ray | LoRA (r=16) via PyTorch |
+| Compute | 4× A100 80GB | Kaggle P100 16GB |
+| Precision | bfloat16 (wide range) | float16 + GradScaler (overflow-prone) |
+| Training | Full parameters via VERL/Ray | LoRA (r=16, alpha=32) via PyTorch |
 | Batch size | 128 | 4 (with gradient accumulation) |
-| Rollouts | 5 per prompt | 3 per prompt |
+| Rollouts | 5 per prompt | 3-5 per prompt |
+| Training samples | 5,120 per dataset | 512 per dataset |
 | Learning rate | 5e-7 (full-param) | 2e-5 (LoRA) + cosine decay |
 | Format threshold | 1.0 (multi-turn required) | 0.5 (single-turn unlocks F1) |
 | N-ary extraction | GPT-4o-mini API | Local regex-based |
 | Framework | VERL + Ray distributed | Custom single-GPU PyTorch |
 
-These differences primarily affect training scale and graph construction quality, but the core algorithm (GRPO with format+answer rewards over hypergraph retrieval) is faithfully implemented.
-
 ## Challenges & Lessons Learned
 
-Reproducing Graph-R1 on Kaggle's free tier (P100 16GB) revealed several insights about RL-based RAG training at constrained scale:
+Reproducing Graph-R1 on Kaggle's free tier (P100 16GB) over 20 iterations revealed:
 
-1. **LoRA LR must be ~40x higher than full-param LR**: The paper's 5e-7 produced zero learning with LoRA. Standard LoRA LR of 2e-5 was needed — a known LoRA best practice, but easy to miss when following a paper's hyperparameters.
+1. **Silent evaluation bugs can mask all training progress**: The answer extraction bug (runs 8-19) meant the model was training correctly but evaluation always returned 0%. The fix was trivial (take last regex match instead of first), but the bug was invisible because the extracted `"..."` looked like a degenerate model output, not a template artifact.
 
-2. **Exploration is the bottleneck, not optimization**: With the LR fixed, the model quickly learned the easy pattern (`<think>` + `<answer>`) but never discovered `<query>` usage for retrieval. RL can only reinforce behaviors the model sometimes produces — it can't teach genuinely new behaviors from scratch.
+2. **Float16 is not bfloat16**: The paper's A100s use bfloat16 (exponent range ±38), which handles the large values in log_softmax and policy ratios natively. Float16 (exponent range ±5) overflows at 65504, requiring explicit float32 upcasting and GradScaler — a P100-specific concern that no A100-trained codebase addresses.
 
-3. **SFT warmup is essential for format learning**: A brief supervised phase teaching the expected output format (think→query→answer) provides the behavioral anchoring that RL then refines. Without it, the model settles into a local optimum of format-correct but content-wrong outputs.
+3. **LoRA LR must be ~40x higher than full-param LR**: The paper's 5e-7 produced zero learning with LoRA. Standard LoRA LR of 2e-5 was needed.
 
-4. **Reward sparsity compounds with compute constraints**: The paper's indicator function `𝟙{R_format=1}` requires multi-turn format perfection before answer quality matters. With limited rollouts and training steps, this creates a chicken-and-egg problem — lowering the threshold to 0.5 gives earlier answer feedback.
+4. **Exploration is the bottleneck, not optimization**: The model quickly learned the easy pattern (`<think>` + `<answer>`) but never discovered `<query>` usage for retrieval without SFT warmup. RL can only reinforce behaviors the model sometimes produces.
 
-5. **Memory management requires architectural changes**: Simply reducing batch sizes isn't enough for 16GB VRAM. Per-rollout backward passes (freeing computational graphs after each), gradient checkpointing, and aggressive cache clearing are all necessary.
+5. **SFT warmup is essential for format learning**: A brief supervised phase (30 steps) teaching the think → query → answer format provides the behavioral anchoring that RL then refines.
+
+6. **GRPO advantage collapse is a real failure mode**: With few rollouts and low temperature, all rollouts converge to the same reward, zeroing out the gradient signal entirely. Temperature, rollout count, and normalization fallbacks all matter.
+
+7. **Memory management requires architectural changes**: Per-rollout backward passes, gradient checkpointing, aggressive cache clearing, and sequence length capping are all necessary for 16GB VRAM — simply reducing batch size is not enough.
 
 ## Evaluation Metrics
 
